@@ -1,0 +1,214 @@
+name: polyglot-relay
+
+x-common-environment: &common-environment
+  POLYGLOT_BROKER_1_HOST: broker-1
+  POLYGLOT_BROKER_1_PORT: "7001"
+  POLYGLOT_BROKER_2_HOST: broker-2
+  POLYGLOT_BROKER_2_PORT: "7002"
+  POLYGLOT_BROKER_BIND_HOST: 0.0.0.0
+  POLYGLOT_WORKER_BIND_HOST: 0.0.0.0
+
+x-app: &app
+  image: polyglot-relay:mock
+  environment:
+    <<: *common-environment
+  networks: [relay]
+  restart: unless-stopped
+
+x-worker-dependencies: &worker-dependencies
+  broker-1:
+    condition: service_healthy
+  broker-2:
+    condition: service_healthy
+
+services:
+  broker-1:
+    <<: *app
+    build:
+      context: .
+      target: mock
+    command: ["python", "broker.py", "--id", "1"]
+    ports: ["7001:7001"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7001"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  broker-2:
+    <<: *app
+    command: ["python", "broker.py", "--id", "2"]
+    ports: ["7002:7002"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7002"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  # English runs as a 2-replica pool to demonstrate round-robin load
+  # balancing across independent worker containers (real parallel
+  # processes, not threads in one process). Every other language runs a
+  # single replica by default -- scale any of them the same way, e.g.:
+  #   docker compose up --scale worker-th=3
+  worker-en-1:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "en", "--mock", "--worker-id", "en-worker-1", "--host", "worker-en-1", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-en-2:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "en", "--mock", "--worker-id", "en-worker-2", "--host", "worker-en-2", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-my:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "my", "--mock", "--worker-id", "my-worker-1", "--host", "worker-my", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-id:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "id", "--mock", "--worker-id", "id-worker-1", "--host", "worker-id", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-ms:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "ms", "--mock", "--worker-id", "ms-worker-1", "--host", "worker-ms", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-th:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "th", "--mock", "--worker-id", "th-worker-1", "--host", "worker-th", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-vi:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "vi", "--mock", "--worker-id", "vi-worker-1", "--host", "worker-vi", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-tl:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "tl", "--mock", "--worker-id", "tl-worker-1", "--host", "worker-tl", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-km:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "km", "--mock", "--worker-id", "km-worker-1", "--host", "worker-km", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  worker-lo:
+    <<: *app
+    command: ["python", "translator_worker.py", "--lang", "lo", "--mock", "--worker-id", "lo-worker-1", "--host", "worker-lo", "--port", "8100"]
+    depends_on: *worker-dependencies
+
+  listener-en:
+    <<: *app
+    profiles: [console]
+    command: ["python", "listener_client.py", "--lang", "en"]
+    depends_on: [worker-en-1, worker-en-2]
+
+  listener-my:
+    <<: *app
+    profiles: [console]
+    command: ["python", "listener_client.py", "--lang", "my"]
+    depends_on: [worker-my]
+
+  demo-producer:
+    <<: *app
+    profiles: [demo]
+    command: ["python", "stt_service.py", "--demo", "--demo-interval", "3"]
+    depends_on:
+      worker-en-1:
+        condition: service_started
+      worker-en-2:
+        condition: service_started
+      worker-my:
+        condition: service_started
+      worker-id:
+        condition: service_started
+      worker-ms:
+        condition: service_started
+      worker-th:
+        condition: service_started
+      worker-vi:
+        condition: service_started
+      worker-tl:
+        condition: service_started
+      worker-km:
+        condition: service_started
+      worker-lo:
+        condition: service_started
+
+  ui:
+    <<: *app
+    # Needs Whisper/ffmpeg to transcribe uploaded/recorded audio in-browser
+    # captions server-side (see web_ui.py's /api/captions/audio) - the
+    # "mock"/"translate" images don't have those, so this overrides the
+    # shared *app anchor's image/build to the heavier "full" target instead.
+    image: polyglot-relay:full
+    build:
+      context: .
+      target: full
+    command: ["python", "web_ui.py", "--host", "0.0.0.0", "--port", "8080"]
+    # Host port 8000, not 8080: 8080 is commonly already bound by other
+    # local software (e.g. another web server) on Windows/Docker Desktop
+    # hosts. The container's internal port stays 8080.
+    ports: ["8000:8080"]
+    # Whisper downloads its model weights on first use (~140MB for "base")
+    # rather than at build time - without this volume, recreating the
+    # container (a rebuild, `up --build`, etc.) would silently re-download
+    # it every time.
+    volumes:
+      - whisper-cache:/home/polyglot/.cache/whisper
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1)"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+    depends_on:
+      worker-en-1:
+        condition: service_started
+      worker-en-2:
+        condition: service_started
+      worker-my:
+        condition: service_started
+      worker-id:
+        condition: service_started
+      worker-ms:
+        condition: service_started
+      worker-th:
+        condition: service_started
+      worker-vi:
+        condition: service_started
+      worker-tl:
+        condition: service_started
+      worker-km:
+        condition: service_started
+      worker-lo:
+        condition: service_started
+
+  stt:
+    <<: *app
+    profiles: [tools]
+    command: ["python", "stt_service.py", "--stdin"]
+    stdin_open: true
+    restart: "no"
+    depends_on: *worker-dependencies
+
+  tests:
+    <<: *app
+    build:
+      context: .
+      target: test
+    profiles: [test]
+    command: ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]
+    restart: "no"
+
+networks:
+  relay:
+    driver: bridge
+
+volumes:
+  whisper-cache:

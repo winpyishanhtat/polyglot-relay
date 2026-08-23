@@ -1,0 +1,26 @@
+# Optional third layer on top of compose.yaml + compose.real.yaml. Only
+# needed if you want to feed a real WAV/audio file through Whisper instead
+# of typing captions into the dashboard. Requires AUDIO_FILE:
+#
+#   $env:GEMINI_API_KEY = "..."
+#   $env:AUDIO_FILE = "C:\path\to\speech.wav"
+#   docker compose -f compose.yaml -f compose.real.yaml -f compose.audio.yaml `
+#     --profile tools up --build -d
+#
+# By default this sends only the Whisper transcript (text), which is what
+# you want - fast, reliable, works for all 15 languages. To instead exercise
+# Gemini Live speech-to-speech translation (slower, not all languages
+# supported yet), add "--send-audio" to the command below.
+services:
+  stt:
+    image: polyglot-relay:full
+    build:
+      context: .
+      target: full
+    profiles: [tools]
+    command: ["python", "stt_service.py", "--input-file", "/audio/input.wav", "--model", "tiny"]
+    volumes:
+      - type: bind
+        source: ${AUDIO_FILE:?Set AUDIO_FILE to a WAV/audio file path}
+        target: /audio/input.wav
+        read_only: true

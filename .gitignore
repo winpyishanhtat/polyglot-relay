@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+eval/results.json
+eval/scenario_events.jsonl
+.env

@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+eval/results.json
+eval/scenario_events.jsonl
+.pytest_cache
+.mypy_cache

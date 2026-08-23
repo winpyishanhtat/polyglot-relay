@@ -1,0 +1,20 @@
+{
+  "transcription": [
+    {"reference": "welcome to the multilingual meeting", "hypothesis": "welcome to the multilingual meeting"},
+    {"reference": "please remain calm and follow the instructions", "hypothesis": "please remain calm and follow instructions"}
+  ],
+  "translation": {
+    "en": [
+      {"reference": "Good morning everyone", "hypothesis": "Good morning everyone"},
+      {"reference": "The meeting starts now", "hypothesis": "The meeting starts now"}
+    ],
+    "ja": [
+      {"reference": "皆さん、おはようございます", "hypothesis": "皆さん、おはようございます"},
+      {"reference": "会議は今始まります", "hypothesis": "会議は今始まります"}
+    ],
+    "my": [
+      {"reference": "အားလုံး မင်္ဂလာနံနက်ခင်းပါ", "hypothesis": "အားလုံး မင်္ဂလာနံနက်ခင်းပါ"},
+      {"reference": "အစည်းအဝေးကို ယခု စတင်ပါမည်", "hypothesis": "အစည်းအဝေးကို ယခု စတင်ပါမည်"}
+    ]
+  }
+}

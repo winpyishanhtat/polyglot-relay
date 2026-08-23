@@ -1,0 +1,105 @@
+# Optional layer that adds a free, self-hosted LibreTranslate service and
+# switches every worker to try it first - no API key, no billing, no daily
+# quota, since translation runs in your own container instead of a metered
+# third-party API. Works completely standalone:
+#
+#   docker compose -f compose.yaml -f compose.libretranslate.yaml up --build -d
+#
+# First boot downloads language models and can take several minutes. Watch
+# progress with:
+#   docker compose -f compose.yaml -f compose.libretranslate.yaml logs -f libretranslate
+# and check what actually loaded once it's healthy:
+#   curl http://localhost:5001/languages
+#
+# Coverage of all 9 ASEAN-set languages isn't guaranteed - Argos Translate
+# (the engine behind LibreTranslate) is community-trained. Confirmed NOT in
+# its catalog: Burmese (my), Khmer (km), Lao (lo) - LT_LOAD_ONLY below
+# deliberately excludes them, since LibreTranslate 1.9.6 aborts loading its
+# *entire* language set if even one requested code is unavailable (not just
+# skipping the bad ones), which otherwise crashes the container on every
+# boot. Those three always need the Gemini fallback (export GEMINI_API_KEY)
+# - there is no free/self-hosted path for them here. Each worker still
+# discovers real coverage at runtime by querying LibreTranslate's
+# /languages endpoint - no other hardcoded assumptions about which of the
+# remaining 6 it has.
+#
+# Optional Gemini fallback for whatever LibreTranslate doesn't cover: just
+# export GEMINI_API_KEY before running the same command above (no need to
+# also add compose.real.yaml - this file already wires GEMINI_API_KEY
+# through if it's set, and TRANSLATION_BACKEND=auto below means "prefer
+# LibreTranslate, fall back to Gemini" rather than "only ever use
+# LibreTranslate"). Set TRANSLATION_BACKEND=libretranslate instead (in your
+# shell, before this command) if you want free-only with no fallback at all.
+x-free-worker: &free-worker
+  image: polyglot-relay:translate
+  build:
+    context: .
+    target: translate
+  environment:
+    TRANSLATION_BACKEND: ${TRANSLATION_BACKEND:-auto}
+    LIBRETRANSLATE_URL: http://libretranslate:5000
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-3.6-flash}
+
+services:
+  demo-producer:
+    profiles: [demo]
+
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    environment:
+      LT_LOAD_ONLY: en,id,ms,th,vi,tl
+    volumes:
+      - lt-models:/home/libretranslate/.local
+    networks: [relay]
+    ports: ["5001:5000"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/languages', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 300s
+
+  worker-en-1:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "en", "--worker-id", "en-1-worker-1", "--host", "worker-en-1", "--port", "8100"]
+
+  worker-en-2:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "en", "--worker-id", "en-2-worker-1", "--host", "worker-en-2", "--port", "8100"]
+
+  worker-my:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "my", "--worker-id", "my-worker-1", "--host", "worker-my", "--port", "8100"]
+
+  worker-id:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "id", "--worker-id", "id-worker-1", "--host", "worker-id", "--port", "8100"]
+
+  worker-ms:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "ms", "--worker-id", "ms-worker-1", "--host", "worker-ms", "--port", "8100"]
+
+  worker-th:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "th", "--worker-id", "th-worker-1", "--host", "worker-th", "--port", "8100"]
+
+  worker-vi:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "vi", "--worker-id", "vi-worker-1", "--host", "worker-vi", "--port", "8100"]
+
+  worker-tl:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "tl", "--worker-id", "tl-worker-1", "--host", "worker-tl", "--port", "8100"]
+
+  worker-km:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "km", "--worker-id", "km-worker-1", "--host", "worker-km", "--port", "8100"]
+
+  worker-lo:
+    <<: *free-worker
+    command: ["python", "translator_worker.py", "--lang", "lo", "--worker-id", "lo-worker-1", "--host", "worker-lo", "--port", "8100"]
+
+volumes:
+  lt-models:

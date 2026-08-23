@@ -1,0 +1,102 @@
+# Optional override that swaps the deterministic mock translators for real
+# Gemini API calls. Only needs GEMINI_API_KEY:
+#
+#   docker compose -f compose.yaml -f compose.real.yaml up --build -d
+#
+# This is all you need for real translation of typed dashboard captions -
+# the web dashboard's composer talks straight to the broker network, no
+# audio pipeline involved. If you also want to feed a WAV file through real
+# Whisper transcription, add compose.audio.yaml on top (see its header
+# comment) - kept separate so it doesn't force everyone to set AUDIO_FILE.
+#
+# Every worker here uses the lightweight `translate` image (just the
+# google-genai SDK - no Whisper/ffmpeg), so a 15-language fleet still builds
+# and starts quickly.
+#
+# By default translation uses Gemini's plain-text endpoint (fast, one REST
+# call per caption, works identically for all 15 languages). Gemini Live
+# speech-to-speech translation is available but off by default - see
+# compose.audio.yaml for how to opt in.
+#
+# GEMINI_TIER defaults to "paid" here, which assumes GEMINI_API_KEY belongs
+# to a billing-enabled Google Cloud project: it skips the per-worker stagger
+# delay (a paid project's RPM ceiling comfortably absorbs all 15 workers
+# calling at once) and defaults GEMINI_TEXT_MODEL to the higher-quality Pro
+# model. Still on a free-tier key? Set GEMINI_TIER=free (e.g. `docker
+# compose -f compose.yaml -f compose.real.yaml up --build -d` with
+# `$env:GEMINI_TIER = "free"` first) to restore the staggered, Flash-model
+# defaults - plus the gemini-rate-gate service below, which every worker
+# blocks on before its Gemini call to keep the whole broadcast under the
+# free tier's real 5 requests/minute ceiling (shared across all workers,
+# not per-worker - see gemini_rate_gate.py). Ignored entirely on paid tier.
+x-gemini-worker: &gemini-worker
+  image: polyglot-relay:translate
+  build:
+    context: .
+    target: translate
+  environment:
+    GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY to your Google AI Studio API key}
+    GEMINI_TIER: ${GEMINI_TIER:-paid}
+    GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-}
+    GEMINI_LIVE_MODEL: ${GEMINI_LIVE_MODEL:-gemini-3.5-live-translate-preview}
+    GEMINI_RATE_GATE_URL: http://gemini-rate-gate:8090
+
+services:
+  demo-producer:
+    profiles: [demo]
+
+  gemini-rate-gate:
+    image: polyglot-relay:mock
+    build:
+      context: .
+      target: mock
+    command: ["python", "gemini_rate_gate.py", "--host", "0.0.0.0", "--port", "8090"]
+    environment:
+      GEMINI_RATE_LIMIT_PER_MINUTE: ${GEMINI_RATE_LIMIT_PER_MINUTE:-5}
+    networks: [relay]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=1)"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  worker-en-1:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "en", "--worker-id", "en-worker-1", "--host", "worker-en-1", "--port", "8100"]
+
+  worker-en-2:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "en", "--worker-id", "en-worker-2", "--host", "worker-en-2", "--port", "8100"]
+
+  worker-my:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "my", "--worker-id", "my-worker-1", "--host", "worker-my", "--port", "8100"]
+
+  worker-id:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "id", "--worker-id", "id-worker-1", "--host", "worker-id", "--port", "8100"]
+
+  worker-ms:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "ms", "--worker-id", "ms-worker-1", "--host", "worker-ms", "--port", "8100"]
+
+  worker-th:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "th", "--worker-id", "th-worker-1", "--host", "worker-th", "--port", "8100"]
+
+  worker-vi:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "vi", "--worker-id", "vi-worker-1", "--host", "worker-vi", "--port", "8100"]
+
+  worker-tl:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "tl", "--worker-id", "tl-worker-1", "--host", "worker-tl", "--port", "8100"]
+
+  worker-km:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "km", "--worker-id", "km-worker-1", "--host", "worker-km", "--port", "8100"]
+
+  worker-lo:
+    <<: *gemini-worker
+    command: ["python", "translator_worker.py", "--lang", "lo", "--worker-id", "lo-worker-1", "--host", "worker-lo", "--port", "8100"]
+

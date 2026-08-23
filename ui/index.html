@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#14171d">
+    <title>Polyglot Relay — Live Interpretation Console</title>
+    <meta name="description" content="Operate and monitor the Polyglot Relay multilingual caption network across ASEAN languages.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,380;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Polyglot Relay home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="20" height="20"><path d="M16 3a13 13 0 1 0 0 26 13 13 0 0 0 0-26Zm0 2.4c1.9 0 3.9 2.9 4.7 7.3h-9.4c.8-4.4 2.8-7.3 4.7-7.3Zm-6.9 7.3H5.6a10.7 10.7 0 0 1 6.2-6.4 15.9 15.9 0 0 0-2.7 6.4Zm0 2.3c-.1.7-.1 1.3-.1 2s0 1.3.1 2H5.5a10.6 10.6 0 0 1-.3-2 10.6 10.6 0 0 1 .3-2h3.6Zm.2 6.3a15.9 15.9 0 0 0 2.7 6.4 10.7 10.7 0 0 1-6.2-6.4h3.5Zm2.3 0h9.4c-.8 4.4-2.8 7.3-4.7 7.3s-3.9-2.9-4.7-7.3Zm10-2.3c.1-.7.1-1.3.1-2s0-1.3-.1-2h4.1c.2.6.3 1.3.3 2s-.1 1.4-.3 2h-4.1Zm-.2-6.3a15.9 15.9 0 0 0-2.7-6.4 10.7 10.7 0 0 1 6.2 6.4h-3.5Zm.3 8.6h3.5a10.7 10.7 0 0 1-6.2 6.4 15.9 15.9 0 0 0 2.7-6.4Z"/></svg>
+        </span>
+        <span><strong>Polyglot Relay</strong><small>Live interpretation console</small></span>
+      </a>
+      <div class="topbar-meta">
+        <span id="network-pill" class="network-pill"><i></i><span>Connecting</span></span>
+        <span id="clock" class="clock">--:--:--</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero-grid" aria-labelledby="page-title">
+        <div class="intro">
+          <p class="eyebrow">Distributed speech intelligence</p>
+          <h1 id="page-title">One voice.<br><em>Every&nbsp;channel.</em></h1>
+          <p class="lede" id="lede-text">Send a live transcript into the relay and watch independent worker pools deliver synchronized captions across ASEAN languages.</p>
+          <div class="dial" id="channel-dial" role="img" aria-label="Live channel indicator"></div>
+        </div>
+
+        <div id="composer" class="composer panel">
+          <div class="panel-heading">
+            <div><h2>Broadcast a caption</h2></div>
+            <span id="queue-count" class="queue-count">Queue clear</span>
+          </div>
+
+          <div class="upload-row">
+            <label class="button secondary file-button" for="audio-file-input">Upload MP3 / audio / video</label>
+            <input class="sr-only" type="file" id="audio-file-input" accept="audio/*,video/*">
+            <span class="upload-hint">Transcribed with Whisper, then sent to the relay</span>
+          </div>
+
+          <div class="record-row">
+            <button id="record-button" class="button primary record-button" type="button">
+              <i class="record-dot" aria-hidden="true"></i><span id="record-label">Record</span>
+            </button>
+            <label class="video-toggle">
+              <input type="checkbox" id="include-video">
+              <span>Include video</span>
+            </label>
+            <span class="record-timer" id="record-timer" hidden>00:00</span>
+          </div>
+          <video id="record-preview" class="record-preview" autoplay muted playsinline hidden></video>
+
+          <div class="source-row">
+            <label for="source-lang">Speaking in</label>
+            <select id="source-lang"><option value="auto">Auto-detect</option></select>
+            <span class="source-hint" id="source-hint">Gemini identifies the language automatically</span>
+          </div>
+          <div class="composer-footer">
+            <span id="composer-status">Upload a file or record to send a caption</span>
+            <div class="actions">
+              <button id="demo-button" class="button secondary" type="button">Run demo</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="network-section" aria-labelledby="network-title">
+        <div class="section-heading">
+          <div><h2 id="network-title">Network pulse</h2></div>
+          <span id="uptime" class="muted">Uptime —</span>
+        </div>
+        <div class="network-strip panel">
+          <div class="node-group">
+            <span class="group-label">Broker replicas</span>
+            <div id="broker-nodes" class="nodes"></div>
+          </div>
+          <div class="node-group workers-group">
+            <span class="group-label">Translation pools · <span id="pool-count">0</span> channels</span>
+            <div id="worker-nodes" class="nodes"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="captions-section" aria-labelledby="captions-title">
+        <div class="section-heading">
+          <div><h2 id="captions-title">Live captions</h2></div>
+          <button id="clear-button" class="text-button" type="button">Clear history</button>
+        </div>
+        <div id="group-tabs" class="group-tabs" role="tablist" aria-label="Filter by language group"></div>
+        <div class="caption-grid" id="caption-grid"></div>
+      </section>
+
+      <section class="activity-section panel" aria-labelledby="activity-title">
+        <div class="section-heading compact">
+          <div><h2 id="activity-title">Recent activity</h2></div>
+          <span class="muted">Newest first</span>
+        </div>
+        <div id="activity-list" class="activity-list"><p class="empty">Connecting to the relay…</p></div>
+      </section>
+    </main>
+
+    <footer><span>Polyglot Relay</span><span>Fault-tolerant by design · Built for every voice</span></footer>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
