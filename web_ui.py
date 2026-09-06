@@ -39,6 +39,9 @@ class DashboardState:
         self.workers = {lang: {"connected": False, "worker_id": None} for lang in config.TARGET_LANGUAGES}
         self.activity: deque[dict[str, Any]] = deque(maxlen=40)
         self.pending = 0
+        self.media = {"status": "idle", "chunks": 0}
+        self.chunks: dict[str, dict] = {}
+        self.sequence = 0
         # The original (pre-translation) text for a chunk, keyed by
         # chunk_id, recorded once at submission time so every language's
         # translated caption can also show what was actually said - a
@@ -55,15 +58,28 @@ class DashboardState:
     def record_original(self, chunk_id: str, text: str, source_lang: str | None) -> None:
         with self._lock:
             if chunk_id not in self.originals and len(self._originals_order) == self._originals_order.maxlen:
-                self.originals.pop(self._originals_order.popleft(), None)
+                expired = self._originals_order.popleft()
+                self.originals.pop(expired, None)
+                self.chunks.pop(expired, None)
             self.originals[chunk_id] = {"text": text, "source_lang": source_lang or "auto"}
             self._originals_order.append(chunk_id)
+            self.sequence += 1
+            self.chunks[chunk_id] = {"chunk_id": chunk_id, "number": self.sequence,
+                "text": text, "source_lang": source_lang, "created_at": time.time(),
+                "targets": {lang: {"status": "source" if lang == source_lang else "awaiting_broker"}
+                            for lang in config.TARGET_LANGUAGES}}
 
     def add_caption(self, message: dict[str, Any]) -> None:
         lang = str(message["lang"])
         chunk_id = message.get("chunk_id")
         with self._lock:
             original = self.originals.get(chunk_id) if chunk_id else None
+            if any(item["chunk_id"] == chunk_id for item in self.captions[lang]):
+                return
+            chunk = self.chunks.get(chunk_id)
+            if chunk:
+                chunk["targets"][lang] = {"status": "source" if lang == chunk["source_lang"] else "completed",
+                                          "worker_id": message.get("worker_id")}
             self.captions[lang].appendleft({
                 "chunk_id": chunk_id,
                 "text": str(message.get("text", "")),
@@ -72,6 +88,7 @@ class DashboardState:
                 "translation_backend": message.get("translation_backend", "relay"),
                 "original_text": original["text"] if original else None,
                 "original_source_lang": original["source_lang"] if original else None,
+                "number": chunk["number"] if chunk else None,
             })
         self.event(f"{lang.upper()} caption received", "caption")
 
@@ -96,6 +113,8 @@ class DashboardState:
                 "workers": {lang: dict(value) for lang, value in self.workers.items()},
                 "activity": list(self.activity),
                 "pending": self.pending,
+                "media": dict(self.media),
+                "chunks": json.loads(json.dumps(list(self.chunks.values()))),
                 "uptime": int(time.time() - self.started_at),
             }
 
@@ -104,8 +123,10 @@ class DashboardRuntime:
     def __init__(self) -> None:
         self.state = DashboardState()
         self.stop_event = threading.Event()
-        self.outbox: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        self.outbox: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=100)
         self.producer = TranscriptProducer()
+        self._media_lock = threading.Lock()
+        self._last_leader = None
 
     def start(self) -> None:
         for lang in config.TARGET_LANGUAGES:
@@ -122,6 +143,10 @@ class DashboardRuntime:
         if source_lang and source_lang != "auto" and source_lang not in config.LANGUAGES:
             raise ValueError(f"Unknown source language {source_lang!r}")
         with self.state._lock:
+            active = sum(any(t["status"] not in ("source", "completed", "failed", "unavailable", "interrupted")
+                             for t in c["targets"].values()) for c in self.state.chunks.values())
+            if active + self.state.pending >= 100:
+                raise ValueError("100 chunks are still processing. Wait for translations before submitting more.")
             self.state.pending += 1
         self.outbox.put((cleaned, source_lang))
         self.state.event("Caption queued for translation")
@@ -143,6 +168,8 @@ class DashboardRuntime:
         """
         if not data:
             raise ValueError("Uploaded audio/video is empty")
+        if source_lang and source_lang != "auto" and source_lang not in config.LANGUAGES:
+            raise ValueError("Select one of the nine supported source languages")
         # A concrete source_lang (the dashboard's "Speaking in" dropdown,
         # anything but "auto") is passed to Whisper too, not just attached
         # as caption metadata - telling it the language up front skips its
@@ -154,14 +181,8 @@ class DashboardRuntime:
             tmp.write(data)
             tmp_path = pathlib.Path(tmp.name)
         try:
-            try:
-                chunks = list(transcribe_file(tmp_path, WHISPER_MODEL, language=language_hint))
-            except SystemExit as exc:
-                raise ValueError(str(exc)) from exc
-            except Exception as exc:
-                raise ValueError(f"Could not transcribe upload: {exc}") from exc
-            if not chunks:
-                raise ValueError("No speech detected in the uploaded audio")
+            chunks = transcribe_file(tmp_path, WHISPER_MODEL, language=language_hint)
+            count = 0
             detected_summary: str | None = None
             for text, _pcm, detected_lang in chunks:
                 # Whisper's own per-file detection (only meaningful when
@@ -177,9 +198,40 @@ class DashboardRuntime:
                     if detected_summary is None:
                         detected_summary = detected_lang
                 self.submit(text, effective_source_lang)
-            return len(chunks), detected_summary
+                count += 1
+                with self.state._lock:
+                    self.state.media.update(chunks=count)
+                self.state.event(f"Audio chunk {count} transcribed and queued", "success")
+            if not count:
+                raise ValueError("No speech detected in the uploaded audio")
+            return count, detected_summary
+        except SystemExit as exc:
+            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            raise ValueError(f"Could not transcribe upload: {exc}") from exc
         finally:
             tmp_path.unlink(missing_ok=True)
+
+    def start_audio(self, data: bytes, source_lang: str | None) -> None:
+        if not data or source_lang not in config.LANGUAGES:
+            raise ValueError("Select a source language and provide an audio/video file")
+        if not self._media_lock.acquire(blocking=False):
+            raise ValueError("An upload is already being transcribed; wait for it to finish")
+        with self.state._lock:
+            self.state.media = {"status": "transcribing", "chunks": 0, "source_lang": source_lang}
+        def process():
+            try:
+                count, _ = self.submit_audio(data, source_lang)
+                with self.state._lock:
+                    self.state.media.update(status="transcribed", chunks=count)
+                self.state.event("Transcription finished; language pools continue processing", "success")
+            except Exception as exc:
+                with self.state._lock:
+                    self.state.media.update(status="failed", error=str(exc))
+                self.state.event(str(exc), "error")
+            finally:
+                self._media_lock.release()
+        threading.Thread(target=process, name="upload-transcriber", daemon=True).start()
 
     def run_demo(self) -> None:
         for sentence in DEMO_SENTENCES:
@@ -197,6 +249,9 @@ class DashboardRuntime:
             try:
                 chunk_id = f"ui-{int(time.time() * 1000)}-{sequence}"
                 self.state.record_original(chunk_id, text, source_lang)
+                if source_lang in config.LANGUAGES:
+                    self.state.add_caption({"lang": source_lang, "chunk_id": chunk_id,
+                        "text": text, "translation_backend": "passthrough", "worker_id": "source"})
                 self.producer.send(text, chunk_id, source_lang=source_lang)
                 self.state.event("Caption sent to the leader broker", "success")
             except Exception as exc:
@@ -236,11 +291,37 @@ class DashboardRuntime:
                     sock.sendall(encode({"type": "heartbeat", "sender_id": "dashboard", "role": "broker"}))
                     response = recv_one(sock)
                     status.update(online=True, leader=bool(response.get("is_leader")),
-                                  leader_id=response.get("leader_id"))
+                                  leader_id=response.get("leader_id"), members=response.get("members", []),
+                                  jobs=response.get("jobs", []))
             except (OSError, ConnectionError, ProtocolError):
                 pass
             statuses.append(status)
         return statuses
+
+    def status(self) -> dict:
+        brokers = self.broker_status()
+        leader = next((b for b in brokers if b["online"] and b["leader"]), None)
+        with self.state._lock:
+            if leader and self._last_leader is not None and leader["id"] != self._last_leader:
+                for chunk in self.state.chunks.values():
+                    for target in chunk["targets"].values():
+                        if target["status"] not in ("completed", "source", "failed", "unavailable"):
+                            target.update(status="interrupted", detail="Leader changed; resubmit this text if no result arrives")
+                self.state.event(f"Leader changed to broker {leader['id']}; check interrupted chunks", "warning")
+            if leader:
+                self._last_leader = leader["id"]
+            for job in (leader or {}).get("jobs", []):
+                chunk = self.state.chunks.get(job["chunk_id"])
+                if chunk and job["lang"] in chunk["targets"]:
+                    current = chunk["targets"][job["lang"]]
+                    if current["status"] not in ("completed", "source"):
+                        chunk["targets"][job["lang"]] = dict(job)
+            snapshot = self.state.snapshot()
+        snapshot["brokers"] = brokers
+        snapshot["settings"] = {"tier": os.getenv("GEMINI_TIER", "free"),
+            "chunk_seconds": float(os.getenv("POLYGLOT_FILE_CHUNK_SECONDS", "15")),
+            "rpm": int(os.getenv("GEMINI_RATE_LIMIT_PER_MINUTE", "5"))}
+        return snapshot
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -275,9 +356,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/api/status":
-            snapshot = self.runtime.state.snapshot()
-            snapshot["brokers"] = self.runtime.broker_status()
-            return self._json(snapshot)
+            return self._json(self.runtime.status())
         if self.path == "/api/captions":
             return self._json(self.runtime.state.snapshot()["captions"])
         if self.path == "/api/languages":
@@ -309,9 +388,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 source_lang = (query.get("source_lang", [None])[0]) or None
                 data = self._raw_body(MAX_AUDIO_UPLOAD_BYTES)
-                count, detected_language = self.runtime.submit_audio(data, source_lang)
-                return self._json({"accepted": True, "captions": count, "detected_language": detected_language},
-                                   HTTPStatus.ACCEPTED)
+                self.runtime.start_audio(data, source_lang)
+                return self._json({"accepted": True, "status": "transcribing"}, HTTPStatus.ACCEPTED)
             if self.path == "/api/demo":
                 self.runtime.run_demo()
                 return self._json({"accepted": True, "count": len(DEMO_SENTENCES)}, HTTPStatus.ACCEPTED)

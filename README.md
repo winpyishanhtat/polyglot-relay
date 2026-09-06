@@ -51,6 +51,11 @@ Two broker replicas run a real **Bully leader-election** protocol; translator wo
 
 ## Quick start
 
+**Selected source → eight translations, chunk by chunk:** see
+[the current chunk workflow and free-tier run guide](docs/CHUNK_WORKFLOW.md).
+It covers the dashboard's progress table, worker queues, broker monitoring,
+API limits, and the distinction between failover and durable message recovery.
+
 **No API key, real translation, 6 of 9 languages free forever:**
 ```bash
 docker compose -f compose.yaml -f compose.libretranslate.yaml up --build -d

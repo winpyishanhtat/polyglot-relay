@@ -32,11 +32,13 @@ CMD ["python", "broker.py", "--id", "1"]
 # expensive layer (ffmpeg + Whisper/PyTorch), worth protecting most.
 FROM base AS full
 USER root
-# Base image points apt at plain http://deb.debian.org, which some
-# networks (VPNs/ISPs/corporate filtering) throttle or drop mid-download
-# while leaving https alone - switch scheme first. -o Acquire::Retries
-# then covers any remaining transient drops.
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+# Use a Debian mirror that remains reachable when the default Fastly-backed
+# endpoint is blocked by an ISP, VPN, or corporate network. Keep both the
+# main and security repositories on the same regional mirror.
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian-security|https://mirror.sg.gs/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|https://mirror.sg.gs/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
     && apt-get update -o Acquire::Retries=5 \
     && apt-get install -y --no-install-recommends -o Acquire::Retries=5 ffmpeg libportaudio2 \
     && rm -rf /var/lib/apt/lists/*

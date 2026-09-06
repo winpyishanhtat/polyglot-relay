@@ -38,8 +38,8 @@ x-free-worker: &free-worker
   environment:
     TRANSLATION_BACKEND: ${TRANSLATION_BACKEND:-auto}
     LIBRETRANSLATE_URL: http://libretranslate:5000
-    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-    GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-3.6-flash}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-insert your key}
+    GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-3.7-flash}
 
 services:
   demo-producer:

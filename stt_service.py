@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
+import os
 import pathlib
 import sys
 import threading
@@ -117,14 +118,13 @@ def _detect_text_language(text: str) -> tuple[str, float] | None:
 
 
 def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = None) -> Iterator[tuple[str, bytes, str | None]]:
-    # One whole-file pass, using Whisper's own internal segmentation, rather
-    # than pre-slicing into fixed AUDIO_CHUNK_SECONDS windows: slicing first
-    # cuts sentences mid-word at arbitrary boundaries (Whisper then often
-    # returns empty text for the fragment, silently dropping that part of
-    # the audio) and pays a full padded-to-30s encoder pass per slice
-    # instead of per ~30s of real audio - both much worse for a finished
-    # recording than for live streaming, which is what that fixed window is
-    # actually tuned for (see transcribe_microphone below).
+    """Decode media once; yield one transcript per short inference window.
+
+    Translation can start before later windows have been transcribed.
+    Windows may split sentences; 15 seconds balances context and latency.
+    Audio decoding still loads the file; this is incremental inference,
+    not a streaming media decoder.
+    """
     whisper, model = _load_whisper(model_name)
     audio = whisper.load_audio(str(path))
     sample_rate = whisper.audio.SAMPLE_RATE
@@ -140,38 +140,22 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
     # entirely - both faster and more accurate than guessing, particularly
     # for whichever of the 9 languages Whisper is weaker at recognizing
     # unprompted.
-    result = model.transcribe(audio, fp16=False, condition_on_previous_text=False, language=language)
-    # Whisper always reports back what language it used, whether given
-    # explicitly (language echoes the same value back) or detected itself
-    # (auto mode) - propagating this to the caller means an "Auto-detect"
-    # upload can still get the passthrough shortcut and the known-source
-    # Gemini prompt variant downstream, instead of staying tagged "auto"
-    # (and every worker guessing) just because the user didn't type it in.
-    detected_language = result.get("language")
-    for segment in result.get("segments", []):
-        text = str(segment.get("text", "")).strip()
-        if not text:
-            continue
-        # Whisper's own confidence signals: no_speech_prob high means it
-        # thinks this span probably isn't speech at all (silence/music/
-        # noise) - a classic hallucination trigger. avg_logprob very low
-        # means it wasn't confident in the words it chose either way.
-        # Same thresholds Whisper's CLI uses to decide "probably bogus".
-        if segment.get("no_speech_prob", 0.0) > 0.6 and segment.get("avg_logprob", 0.0) < -1.0:
-            continue
-        # Second, independent hallucination signal: a text-based language
-        # ID confidently disagreeing with what Whisper thinks it just
-        # transcribed. Only acts on a *confident* disagreement (>0.9) -
-        # short fragments are inherently ambiguous to a text classifier,
-        # so a low-confidence guess isn't worth discarding real captions
-        # over.
-        expected_lang = language or detected_language
-        text_id = _detect_text_language(text)
-        if expected_lang and text_id and text_id[0] != expected_lang and text_id[1] > 0.9:
-            continue
-        start = max(0, int(segment["start"] * sample_rate))
-        end = min(len(audio), int(segment["end"] * sample_rate))
-        yield text, _pcm16(audio[start:end]), detected_language
+    window_seconds = max(5, min(60, float(os.getenv("POLYGLOT_FILE_CHUNK_SECONDS", "15"))))
+    window_samples = int(window_seconds * sample_rate)
+    for offset in range(0, len(audio), window_samples):
+        window = audio[offset:offset + window_samples]
+        result = model.transcribe(window, fp16=False, condition_on_previous_text=False, language=language)
+        pieces = []
+        for segment in result.get("segments", []):
+            text = str(segment.get("text", "")).strip()
+            if not text:
+                continue
+            if segment.get("no_speech_prob", 0.0) > 0.6 and segment.get("avg_logprob", 0.0) < -1.0:
+                continue
+            pieces.append(text)
+        text = " ".join(pieces)
+        if text:
+            yield text, _pcm16(window), result.get("language")
 
 
 def transcribe_microphone(model_name: str, language: str | None = None) -> Iterator[tuple[str, bytes]]:

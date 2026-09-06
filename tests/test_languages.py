@@ -210,11 +210,12 @@ class GeminiRateGateTests(unittest.TestCase):
         # slash in the request path.
         self.assertEqual(called_url, "http://gate:8090/acquire")
 
-    def test_unreachable_gate_is_a_warning_not_a_failure(self):
+    def test_unreachable_gate_does_not_bypass_request_budget(self):
         with mock.patch.dict(os.environ, {"GEMINI_TIER": "free", "GEMINI_RATE_GATE_URL": "http://gate:8090"}):
             translator = Translator("th", mock=True)
         with mock.patch("translator_worker.urllib.request.urlopen", side_effect=OSError("unreachable")):
-            translator._await_gemini_slot()  # must not raise
+            with self.assertRaisesRegex(RuntimeError, "request was not sent"):
+                translator._await_gemini_slot()
 
 
 class RetryLogicTests(unittest.TestCase):

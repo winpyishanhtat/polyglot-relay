@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from stt_service import _detect_text_language
 
@@ -9,7 +10,8 @@ class TextLanguageDetectionTests(unittest.TestCase):
         # install py3langid - the lazy import must degrade gracefully to
         # "no signal available" rather than raising, matching how
         # _load_whisper's own lazy `import whisper` behaves.
-        result = _detect_text_language("some text")
+        with mock.patch.dict("sys.modules", {"py3langid": None}):
+            result = _detect_text_language("some text")
         self.assertIsNone(result)
 
 

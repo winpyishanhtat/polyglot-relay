@@ -7,6 +7,11 @@ let lastCaptionSignature = "";
 let LANGS = [];
 let LANG_BY_CODE = {};
 let activeFilter = "All";
+let uploadSending = false;
+let recordedSource = "en";
+const STATE_LABELS = {source: "Source", awaiting_broker: "Sending", queued: "Queued", processing: "Processing",
+  quota_wait: "Quota wait", retrying: "Retrying", translating: "Translating", completed: "Done",
+  failed: "Failed", unavailable: "No worker", interrupted: "Interrupted"};
 
 const EMPTY_COPY = {
   my: "ပထမစာတန်းကို စောင့်နေသည်…",
@@ -79,9 +84,10 @@ function buildSourceSelect() {
     select.append(option);
   }
   const updateHint = () => {
-    hint.textContent = select.value === "auto"
-      ? "Whisper identifies the spoken language for audio, Gemini for typed text - either way, the result carries through to skip translation for the matching channel"
-      : "Matching caption card skips translation, and Whisper transcribes audio faster and more accurately when told the language up front - only pick this if you're sure, a wrong pick actively hurts transcription";
+    hint.textContent = `${LANG_BY_CODE[select.value]?.name || "Selected language"} stays as the source transcript. The other eight channels translate each chunk.`;
+    for (const card of document.querySelectorAll(".caption-card")) {
+      card.classList.toggle("source-channel", card.dataset.lang === select.value);
+    }
   };
   // Deliberately NOT remembered across page loads (was tried, then
   // reverted): a stale non-auto pick from a previous, different-language
@@ -156,7 +162,7 @@ function buildCaptionGrid() {
     left.append(codeBadge, titleWrap);
     const liveTag = document.createElement("span");
     liveTag.className = "live-tag";
-    liveTag.textContent = "Live";
+    liveTag.textContent = "Waiting";
     header.append(left, liveTag);
 
     const feed = document.createElement("div");
@@ -198,10 +204,11 @@ function makeNode(title, subtitle, online, opts = {}) {
 }
 
 function renderNetwork(data) {
+  const leader = data.brokers.find(b => b.online && b.leader);
   const brokers = $("#broker-nodes");
   brokers.replaceChildren(...data.brokers.map((broker) => makeNode(
     `Broker ${broker.id}`,
-    broker.leader ? "Active leader" : broker.online ? "Standby replica" : "Offline",
+    broker.leader ? `Active leader · ${(broker.members || []).length} workers` : broker.online ? "Standby · monitoring heartbeats" : "Offline / unreachable",
     broker.online,
     { leader: broker.leader },
   )));
@@ -209,12 +216,32 @@ function renderNetwork(data) {
   const workers = $("#worker-nodes");
   workers.replaceChildren(...LANGS.map((lang, index) => {
     const worker = data.workers[lang.code] || { connected: false };
-    return makeNode(
+    const members = (leader?.members || []).filter(m => m.lang === lang.code);
+    const jobs = (leader?.jobs || []).filter(j => j.lang === lang.code);
+    const running = jobs.filter(j => ["processing", "translating", "quota_wait", "retrying"].includes(j.status));
+    const queued = jobs.filter(j => j.status === "queued").length;
+    const failed = jobs.filter(j => ["failed", "unavailable"].includes(j.status)).length;
+    const node = makeNode(
       lang.name,
-      worker.connected ? worker.worker_id : "Reconnecting",
-      worker.connected,
+      `${members.length} worker${members.length === 1 ? "" : "s"} · ${queued} queued · ${running.length} active${failed ? ` · ${failed} failed` : ""}`,
+      members.length > 0,
       { group: lang.group, channelNo: channelNo(index) },
     );
+    for (const member of members) {
+      const detail = document.createElement("small");
+      const job = running.find(j => j.worker_id === member.worker_id);
+      detail.textContent = `${member.worker_id} · ${job ? STATE_LABELS[job.status] : "Ready"} · ♥ ${member.heartbeat_age}s`;
+      node.append(detail);
+    }
+    node.classList.toggle("working", running.length > 0);
+    const card = document.querySelector(`.caption-card[data-lang="${lang.code}"]`);
+    if (card) {
+      card.classList.toggle("connected", worker.connected);
+      card.classList.toggle("source-channel", lang.code === $("#source-lang").value);
+      card.querySelector(".live-tag").textContent = running.length ? STATE_LABELS[running[0].status]
+        : lang.code === $("#source-lang").value ? "Source" : worker.connected ? "Ready" : "Offline";
+    }
+    return node;
   }));
   $("#pool-count").textContent = LANGS.length;
 
@@ -230,6 +257,46 @@ function renderNetwork(data) {
   pill.querySelector("span").textContent = healthy ? "Network healthy" : "Network recovering";
   $("#uptime").textContent = `Uptime ${formatUptime(data.uptime)}`;
   $("#queue-count").textContent = data.pending ? `${data.pending} queued` : "Queue clear";
+}
+
+function renderChunks(data) {
+  const chunks = data.chunks || [];
+  const targets = chunks.flatMap(c => Object.values(c.targets).filter(t => t.status !== "source"));
+  const done = targets.filter(t => t.status === "completed").length;
+  const failed = targets.filter(t => ["failed", "unavailable", "interrupted"].includes(t.status)).length;
+  $("#translation-progress").textContent = `${chunks.length} chunk${chunks.length === 1 ? "" : "s"} · ${done}/${targets.length} translations done${failed ? ` · ${failed} need attention` : ""}`;
+  const media = data.media || {status: "idle"};
+  $("#media-progress").textContent = media.status === "transcribing" ? `Transcribing file… ${media.chunks} speech chunks sent so far. Earlier chunks are already in the pools.`
+    : media.status === "failed" ? `Transcription failed: ${media.error}`
+    : media.status === "transcribed" ? `Transcription finished: ${media.chunks} speech chunks. Watch the rows below for translation progress.`
+    : "Upload a file, record then stop, or submit text. Each row follows one chunk across every channel.";
+  const settings = data.settings || {};
+  const members = data.brokers.find(b => b.leader && b.online)?.members || [];
+  const mockMode = members.length && members.every(m => m.mode === "mock");
+  $("#quota-note").textContent = mockMode ? `Mock demonstration · ${settings.chunk_seconds}s audio windows · Workers simulate translation without API requests. Use the Gemini Compose overlay for real translations.`
+    : `${settings.tier === "free" ? `Free tier · local budget ${settings.rpm} requests/min` : "Paid tier"} · ${settings.chunk_seconds}s audio windows · 8 translation requests per speech chunk. Results arrive independently; quota waits are expected.`;
+  if (!uploadSending && (!mediaRecorder || mediaRecorder.state !== "recording")) {
+    setComposerBusy(media.status === "transcribing", media.status === "transcribing" ? "Transcribing; follow chunk progress below" : undefined);
+  }
+  const head = document.createElement("tr");
+  for (const title of ["Chunk / source", ...LANGS.map(l => l.code.toUpperCase())]) {
+    const th = document.createElement("th"); th.textContent = title; th.scope = "col"; head.append(th);
+  }
+  $("#chunk-table thead").replaceChildren(head);
+  $("#chunk-table tbody").replaceChildren(...chunks.slice(-40).map(chunk => {
+    const row = document.createElement("tr");
+    const title = document.createElement("th"); title.scope = "row";
+    const label = document.createElement("strong"); label.textContent = `#${chunk.number} · ${LANG_BY_CODE[chunk.source_lang]?.name || "Auto"}`;
+    const text = document.createElement("small"); text.textContent = chunk.text; title.append(label, text); row.append(title);
+    for (const lang of LANGS) {
+      const cell = document.createElement("td"); const state = chunk.targets[lang.code] || {status: "queued"};
+      const badge = document.createElement("span"); badge.className = `chunk-state state-${state.status}`;
+      badge.textContent = STATE_LABELS[state.status] || state.status;
+      badge.title = [state.worker_id, state.detail].filter(Boolean).join(" · ");
+      cell.append(badge); row.append(cell);
+    }
+    return row;
+  }));
 }
 
 function renderCaptions(captions, workers) {
@@ -248,7 +315,7 @@ function renderCaptions(captions, workers) {
       feed.replaceChildren(empty);
       continue;
     }
-    const elements = items.slice(0, 12).map((item) => {
+    const elements = [...items].sort((a, b) => (a.number || 0) - (b.number || 0)).slice(-12).map((item) => {
       const article = document.createElement("div");
       article.className = "caption-item";
       const text = document.createElement("p");
@@ -269,7 +336,7 @@ function renderCaptions(captions, workers) {
       const meta = document.createElement("div");
       meta.className = "caption-meta";
       const time = document.createElement("span");
-      time.textContent = formatTime(item.timestamp);
+      time.textContent = `${item.number ? `#${item.number} · ` : ""}${formatTime(item.timestamp)}`;
       const worker = document.createElement("span");
       worker.className = `backend-tag backend-${item.translation_backend || "relay"}`;
       worker.textContent = item.translation_backend === "passthrough" ? "same language" : (item.translation_backend || item.worker_id || "relay");
@@ -304,6 +371,7 @@ async function refresh() {
     if (!response.ok) throw new Error("Dashboard API unavailable");
     const data = await response.json();
     renderNetwork(data);
+    renderChunks(data);
     renderCaptions(data.captions, data.workers);
     renderActivity(data.activity);
   } catch (error) {
@@ -321,11 +389,16 @@ async function refresh() {
 function setComposerBusy(busy, statusText) {
   $("#record-button").disabled = busy;
   $("#audio-file-input").disabled = busy;
+  $("#source-lang").disabled = busy;
+  $("#include-video").disabled = busy;
+  $("#demo-button").disabled = busy;
   document.querySelector(".file-button").classList.toggle("is-disabled", busy);
   $("#composer-status").textContent = statusText || "Upload a file or record to send a caption";
 }
 
 async function postAudio(blob, sourceLang, label) {
+  if (blob.size > 25 * 1024 * 1024) { showToast("File exceeds 25 MB. Please use a shorter clip."); setComposerBusy(false); return; }
+  uploadSending = true;
   setComposerBusy(true, `Transcribing ${label}…`);
   try {
     const response = await fetch(`/api/captions/audio?source_lang=${encodeURIComponent(sourceLang)}`, {
@@ -335,15 +408,14 @@ async function postAudio(blob, sourceLang, label) {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "Upload failed");
-    const count = data.captions || 1;
-    const detectedLang = data.detected_language && LANG_BY_CODE[data.detected_language];
-    const detectedNote = detectedLang ? ` — detected ${detectedLang.name}` : "";
-    showToast(`Sent ${count} caption${count === 1 ? "" : "s"} to the relay${detectedNote}`);
+    showToast("Upload accepted. Follow each chunk in Chunk journey.");
     refresh();
   } catch (error) {
     showToast(error.message);
   } finally {
+    uploadSending = false;
     setComposerBusy(false);
+    refresh();
   }
 }
 
@@ -375,6 +447,7 @@ function updateRecordTimer() {
 }
 
 async function startRecording() {
+  recordedSource = $("#source-lang").value;
   const includeVideo = $("#include-video").checked;
   let stream;
   try {
@@ -393,9 +466,14 @@ async function startRecording() {
   mediaRecorder.addEventListener("stop", async () => {
     const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || "application/octet-stream" });
     recordedChunks = [];
-    await postAudio(blob, $("#source-lang").value, "recording");
+    await postAudio(blob, recordedSource, "recording");
   });
   mediaRecorder.start();
+  $("#source-lang").disabled = true;
+  $("#audio-file-input").disabled = true;
+  $("#include-video").disabled = true;
+  $("#demo-button").disabled = true;
+  $("#composer-status").textContent = "Recording… press Stop to transcribe and translate in chunks";
 
   const preview = $("#record-preview");
   if (includeVideo) {
@@ -436,9 +514,23 @@ $("#record-button").addEventListener("click", () => {
 
 $("#demo-button").addEventListener("click", async () => {
   try {
+    $("#source-lang").value = "en";
+    $("#source-lang").dispatchEvent(new Event("change"));
     await post("/api/demo");
     showToast("Four-caption demo started");
   } catch (error) { showToast(error.message); }
+});
+
+$("#text-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = $("#text-form button"); button.disabled = true;
+  try {
+    await post("/api/captions", {text: $("#caption-text").value, source_lang: $("#source-lang").value});
+    $("#caption-text").value = "";
+    showToast("Chunk queued for eight translation pools");
+    refresh();
+  } catch (error) { showToast(error.message); }
+  finally { button.disabled = false; }
 });
 
 $("#clear-button").addEventListener("click", async () => {
@@ -456,8 +548,8 @@ async function boot() {
   buildSourceSelect();
   buildGroupTabs();
   buildCaptionGrid();
-  setInterval(refresh, 1000);
-  refresh();
+  async function poll() { await refresh(); setTimeout(poll, 1000); }
+  poll();
 }
 
 boot();

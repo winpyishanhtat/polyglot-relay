@@ -1,8 +1,8 @@
 """Shared sliding-window rate gate for Gemini's free-tier RPM cap.
 
 One caption fans out to every language worker at once, but the free tier's
-"generate_content_free_tier_requests" quota (5 requests/minute, shared
-across the whole project+model - not per worker) can't be satisfied by each
+request budget (configurable, shared across the project/model, not per
+worker; five requests/minute is a local default) can't be enforced by each
 worker staggering its own request independently: 9 workers each waiting a
 fraction of a second still all land in the same 60-second window. This
 server is the single source of truth for "is a slot free right now" - every
@@ -33,24 +33,31 @@ class SlidingWindowLimiter:
     are workers waiting on a slot (one ThreadingHTTPServer request each)."""
 
     def __init__(self, limit: int, window_seconds: float = WINDOW_SECONDS) -> None:
+        if limit < 1 or window_seconds <= 0:
+            raise ValueError("Rate limit and window must be positive")
         self.limit = limit
         self.window_seconds = window_seconds
         self._lock = threading.Lock()
         self._timestamps: collections.deque[float] = collections.deque()
+        self._tickets: collections.deque[object] = collections.deque()
 
     def acquire(self) -> tuple[float, int]:
         """Blocks until a slot is free, then reserves it. Returns
         (seconds waited, slots now in use) - the latter purely for logging."""
         waited = 0.0
+        ticket = object()
+        with self._lock:
+            self._tickets.append(ticket)
         while True:
             with self._lock:
                 now = time.monotonic()
                 while self._timestamps and now - self._timestamps[0] >= self.window_seconds:
                     self._timestamps.popleft()
-                if len(self._timestamps) < self.limit:
+                if self._tickets[0] is ticket and len(self._timestamps) < self.limit:
+                    self._tickets.popleft()
                     self._timestamps.append(now)
                     return waited, len(self._timestamps)
-                sleep_for = min(self.window_seconds - (now - self._timestamps[0]) + 0.05, 5.0)
+                sleep_for = min(self.window_seconds, 0.1)
             time.sleep(sleep_for)
             waited += sleep_for
 

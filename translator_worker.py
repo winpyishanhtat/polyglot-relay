@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import queue
 import re
 import socket
 import threading
@@ -147,6 +148,7 @@ def _libretranslate_get(url: str, timeout: float = 5.0):
 class Translator:
     def __init__(self, lang: str, mock: bool = False) -> None:
         self.lang, self.mock, self._client = lang, mock, None
+        self.report_status = lambda status, detail="": None
         # GEMINI_TIER picks the defaults below; it never overrides an
         # explicitly-set GEMINI_TEXT_MODEL / POLYGLOT_STAGGER_STEP_SECONDS.
         # "paid" (default): a billing-enabled Google AI Studio / Cloud key.
@@ -213,10 +215,11 @@ class Translator:
         if self.tier != "free" or not self.rate_gate_url:
             return
         try:
-            urllib.request.urlopen(f"{self.rate_gate_url}/acquire", timeout=70)
+            self.report_status("quota_wait", "Waiting for the shared Gemini request budget")
+            with urllib.request.urlopen(f"{self.rate_gate_url}/acquire", timeout=900):
+                pass
         except Exception as exc:
-            LOG.warning("Could not reach Gemini rate gate at %s (%s); proceeding without it",
-                        self.rate_gate_url, exc)
+            raise RuntimeError("Shared rate gate unavailable; Gemini request was not sent") from exc
 
     def _get_client(self):
         if self._client is None:
@@ -227,7 +230,7 @@ class Translator:
             api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if not api_key:
                 raise RuntimeError("set GEMINI_API_KEY or run with --mock")
-            self._client = genai.Client(api_key=api_key)
+            self._client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
         return self._client
 
     def _call_with_retry(self, fn, *, base_delay: float = 1.0):
@@ -250,6 +253,7 @@ class Translator:
                     delay = max(delay, min(suggested, 60.0))
                 LOG.warning("Gemini call failed (%s); retry %s/%s in %.1fs",
                             exc, attempt, self.max_retries, delay)
+                self.report_status("retrying", f"Retry {attempt}/{self.max_retries} in {delay:.0f}s")
                 time.sleep(delay)
 
     async def _call_with_retry_async(self, fn, *, base_delay: float = 1.5):
@@ -347,13 +351,14 @@ class Translator:
         from google.genai import types  # type: ignore
 
         time.sleep(self.stagger_seconds)
-        self._await_gemini_slot()
         instruction = translation_instruction(self.lang, source_lang)
-        response = self._call_with_retry(lambda: self._get_client().models.generate_content(
-            model=self.text_model,
-            contents=text,
-            config=types.GenerateContentConfig(system_instruction=instruction),
-        ))
+        def request():
+            self._await_gemini_slot()
+            self.report_status("translating", "Gemini request in progress")
+            return self._get_client().models.generate_content(
+                model=self.text_model, contents=text,
+                config=types.GenerateContentConfig(system_instruction=instruction))
+        response = self._call_with_retry(request)
         translated = (response.text or "").strip()
         if not translated:
             raise RuntimeError("Gemini returned an empty text translation")
@@ -414,21 +419,29 @@ class TranslatorWorker:
         self.listeners: set[socket.socket] = set()
         self._listeners_lock = threading.Lock()
         self._broker_send_lock = threading.Lock()
+        self._work = queue.Queue(maxsize=100)
 
     def serve(self) -> None:
         self._start_listener_server()
+        threading.Thread(target=self._translation_loop, daemon=True).start()
         while not self.stop_event.is_set():
             broker: socket.socket | None = None
             heartbeat_stop = threading.Event()
             try:
                 registration = {"type": "register", "role": "worker", "lang": self.lang,
-                                "worker_id": self.worker_id, "host": self.host, "port": self.port}
+                                "worker_id": self.worker_id, "host": self.host, "port": self.port,
+                                "mode": "mock" if self.translator.mock else self.translator.backend_preference}
                 broker, response = connect_to_leader(registration)
                 LOG.info("Registered with leader broker %s", response.get("leader_id"))
                 threading.Thread(target=self._heartbeat_loop, args=(broker, heartbeat_stop), daemon=True).start()
                 for message in decode_stream(broker):
                     if message["type"] == "transcript_chunk":
-                        self._process_chunk(broker, message)
+                        try:
+                            self._work.put_nowait((broker, message))
+                        except queue.Full:
+                            self._send_broker(broker, {"type": "chunk_status", "chunk_id": message["chunk_id"],
+                                "lang": self.lang, "worker_id": self.worker_id, "status": "failed",
+                                "detail": "Worker queue full; submit a shorter recording"})
                     elif message["type"] == "translated_chunk":
                         self._broadcast(message)
             except (OSError, ConnectionError, ProtocolError) as exc:
@@ -440,8 +453,25 @@ class TranslatorWorker:
                     broker.close()
             self.stop_event.wait(config.RECONNECT_DELAY)
 
+    def _translation_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                broker, message = self._work.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if broker.fileno() != -1:
+                    self._process_chunk(broker, message)
+            finally:
+                self._work.task_done()
+
     def _process_chunk(self, broker: socket.socket, message: dict) -> None:
+        def report(status, detail=""):
+            self._send_broker(broker, {"type": "chunk_status", "chunk_id": message["chunk_id"],
+                "lang": self.lang, "worker_id": self.worker_id, "status": status, "detail": detail})
+        self.translator.report_status = report
         try:
+            report("processing")
             translated, backend = self.translator.translate(
                 str(message["text"]),
                 audio_pcm_b64=message.get("audio_pcm_b64"),
@@ -455,6 +485,11 @@ class TranslatorWorker:
             LOG.info("Translated chunk %s via %s", message["chunk_id"], backend)
         except Exception as exc:
             LOG.error("Translation failed for chunk %s: %s", message.get("chunk_id"), exc)
+            try:
+                detail = "Gemini daily quota exhausted" if _is_daily_quota_exhausted(exc) else "Translation failed; inspect worker logs"
+                report("failed", detail)
+            except OSError:
+                pass
 
     def _heartbeat_loop(self, broker: socket.socket, stop: threading.Event) -> None:
         while not stop.wait(config.HEARTBEAT_INTERVAL):

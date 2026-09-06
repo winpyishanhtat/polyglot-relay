@@ -8,6 +8,7 @@ import signal
 import socket
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ class WorkerConnection:
     sock: socket.socket
     last_seen: float = field(default_factory=time.monotonic)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
+    mode: str = "unknown"
 
     def send(self, message: dict[str, Any]) -> None:
         with self.send_lock:
@@ -93,6 +95,8 @@ class Broker:
         self.broker_id = broker_id
         self.peers = {b["id"]: b for b in config.BROKERS if b["id"] != broker_id}
         self.registry = WorkerRegistry()
+        self.jobs = OrderedDict()
+        self._jobs_lock = threading.RLock()
         self.stop_event = threading.Event()
         self.server: socket.socket | None = None
         self._clients: set[socket.socket] = set()
@@ -187,7 +191,8 @@ class Broker:
                 return
             if kind == "heartbeat" and first.get("role") == "broker":
                 conn.sendall(encode({"type": "heartbeat_ack", "sender_id": self.broker_id,
-                                     "leader_id": self.election.leader_id, "is_leader": self.is_leader}))
+                                     "leader_id": self.election.leader_id, "is_leader": self.is_leader,
+                                     **(self.telemetry() if first.get("sender_id") == "dashboard" else {})}))
                 return
             if not self.is_leader:
                 conn.sendall(encode(self._redirect()))
@@ -206,7 +211,10 @@ class Broker:
                 for message in messages:
                     worker.last_seen = time.monotonic()
                     if message["type"] == "translated_chunk":
+                        self.update_job(message, "completed")
                         self._publish_translation(message)
+                    elif message["type"] == "chunk_status":
+                        self.update_job(message, str(message.get("status", "processing")))
             elif role == "stt":
                 conn.sendall(encode({"type": "register_ack", "accepted": True, "leader_id": self.broker_id}))
                 self._track_client(conn)
@@ -232,6 +240,7 @@ class Broker:
         if lang not in config.TARGET_LANGUAGES:
             raise ValueError(f"unsupported language {lang}")
         worker = WorkerConnection(str(message["worker_id"]), lang, str(message["host"]), int(message["port"]), conn)
+        worker.mode = str(message.get("mode", "unknown"))
         self.registry.add(worker)
         worker.send({"type": "register_ack", "accepted": True, "leader_id": self.broker_id})
         LOG.info("Worker registered: %s lang=%s endpoint=%s:%s", worker.worker_id, lang, worker.host, worker.port)
@@ -249,6 +258,12 @@ class Broker:
 
     def route_chunk(self, chunk: dict) -> None:
         for lang in config.TARGET_LANGUAGES:
+            if lang == chunk.get("source_lang"):
+                result = {**chunk, "type": "translated_chunk", "lang": lang,
+                          "worker_id": f"broker-{self.broker_id}", "translation_backend": "passthrough"}
+                self.update_job(result, "source")
+                self._publish_translation(result)
+                continue
             attempts = len(self.registry.snapshot(lang))
             delivered = False
             for _ in range(attempts):
@@ -256,6 +271,7 @@ class Broker:
                 if not worker:
                     break
                 try:
+                    self.update_job({**chunk, "lang": lang, "worker_id": worker.worker_id}, "queued")
                     worker.send(chunk)
                     LOG.info("Forwarded chunk %s to %s worker %s", chunk.get("chunk_id"), lang, worker.worker_id)
                     delivered = True
@@ -264,7 +280,32 @@ class Broker:
                     self.registry.remove(worker.worker_id)
                     LOG.warning("Removed unreachable worker %s", worker.worker_id)
             if not delivered:
+                self.update_job({**chunk, "lang": lang}, "unavailable")
                 LOG.warning("No available %s worker for chunk %s", lang, chunk.get("chunk_id"))
+
+    def update_job(self, message: dict, status: str) -> None:
+        key = (message.get("chunk_id"), message.get("lang"))
+        with self._jobs_lock:
+            row = self.jobs.setdefault(key, {"chunk_id": key[0], "lang": key[1]})
+            row.update(status=status, updated_at=time.time())
+            for field in ("worker_id", "detail"):
+                if field in message:
+                    row[field] = message[field]
+            while len(self.jobs) > 1800:
+                self.jobs.popitem(last=False)
+
+    def telemetry(self) -> dict:
+        registered = {w.worker_id for w in self.registry.all()}
+        with self._jobs_lock:
+            for row in self.jobs.values():
+                if row["status"] in ("queued", "processing", "quota_wait", "retrying", "translating") and row.get("worker_id") not in registered:
+                    row.update(status="interrupted", detail="Worker disconnected; resubmit this text")
+            jobs = [dict(row) for row in self.jobs.values()]
+        members = [{"worker_id": w.worker_id, "lang": w.lang,
+                    "mode": w.mode,
+                    "heartbeat_age": round(time.monotonic() - w.last_seen, 1)}
+                   for w in self.registry.all()]
+        return {"members": members, "jobs": jobs}
 
     def _publish_translation(self, message: dict) -> None:
         lang = str(message.get("lang"))
