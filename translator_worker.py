@@ -70,13 +70,19 @@ def _suggested_retry_delay(exc: Exception) -> float | None:
 
 
 def _is_daily_quota_exhausted(exc: Exception) -> bool:
-    """A 429 whose quotaId mentions PerDay is a daily cap, not a per-minute
-    one - Google's own suggested retryDelay in this case is misleading
-    (often a handful of seconds) because the quota genuinely will not free
-    up again for hours. Retrying it burns time and log noise for nothing,
-    so this is treated as non-retryable even though it is a 429."""
+    """A 429 whose quotaId mentions PerDay is usually a genuine daily cap
+    with no retryDelay in the payload at all - in that case Google gives no
+    indication it will clear soon, so retrying burns time and log noise for
+    nothing and this is treated as non-retryable even though it is a 429.
+    But confirmed on a real billing-enabled key: a "PerDay"-labeled 429 that
+    *does* carry a short, explicit retryDelay (e.g. "retryDelay": "20s") has
+    recovered within that same window - the quotaId label appears to
+    sometimes get attached to what is really a burst/concurrency limit
+    rather than a true 24-hour exhaustion. Only the delay-less case is
+    treated as unrecoverable-today; when a delay is present, fall through
+    to the normal retryable path so it gets an honest retry."""
     text = str(exc)
-    return "PerDay" in text or "RequestsPerDay" in text
+    return ("PerDay" in text or "RequestsPerDay" in text) and _suggested_retry_delay(exc) is None
 
 
 # Khmer and Lao specifically have far less training data available to
@@ -113,7 +119,9 @@ def translation_instruction(target_lang: str, source_lang: str | None = None) ->
             "speaker would actually say it, not a stiff word-for-word translation. It may be an "
             "incomplete sentence (live captions arrive in short chunks); translate it as-is rather "
             "than trying to complete or restructure it. Preserve the speaker's tone (casual, formal, "
-            "urgent, etc.), proper names, and numbers exactly." + care_note + " Return only the "
+            "urgent, etc.), proper names, and numbers exactly. Carry over every detail in the "
+            "original - do not omit, summarize, or simplify any part of it, even filler words that "
+            "carry meaning." + care_note + " Return only the "
             "translated caption - no explanation, labels, quotes, or Markdown."
         )
     return (
@@ -123,7 +131,9 @@ def translation_instruction(target_lang: str, source_lang: str | None = None) ->
         "speaker would actually say it, not a stiff word-for-word translation. It may be an "
         "incomplete sentence (live captions arrive in short chunks); translate it as-is rather "
         "than trying to complete or restructure it. Preserve the speaker's tone (casual, formal, "
-        f"urgent, etc.), proper names, and numbers exactly." + care_note + " If it is already in "
+        "urgent, etc.), proper names, and numbers exactly. Carry over every detail in the original "
+        "- do not omit, summarize, or simplify any part of it, even filler words that carry "
+        "meaning." + care_note + " If it is already in "
         f"{config.language_label(target_lang)}, return it unchanged. Return only the translated "
         "caption - no explanation, labels, quotes, or Markdown."
     )
@@ -227,7 +237,18 @@ class Translator:
                 from google import genai  # type: ignore
             except ImportError as exc:
                 raise RuntimeError("install google-genai or run with --mock") from exc
-            api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            # A per-language override (e.g. GEMINI_API_KEY_KM) lets each
+            # Gemini-dependent language use its own API key/project, so its
+            # daily quota is no longer shared with the others - my/km/lo
+            # currently all draw from one pool under a single key, which is
+            # the actual root cause of the contention described in
+            # .env.example. Falls back to the shared key when unset, so
+            # this is a no-op until separate keys are actually provided.
+            api_key = (
+                os.getenv(f"GEMINI_API_KEY_{self.lang.upper()}")
+                or os.getenv("GEMINI_API_KEY")
+                or os.getenv("GOOGLE_API_KEY")
+            )
             if not api_key:
                 raise RuntimeError("set GEMINI_API_KEY or run with --mock")
             self._client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
@@ -357,7 +378,14 @@ class Translator:
             self.report_status("translating", "Gemini request in progress")
             return self._get_client().models.generate_content(
                 model=self.text_model, contents=text,
-                config=types.GenerateContentConfig(system_instruction=instruction))
+                config=types.GenerateContentConfig(
+                    system_instruction=instruction,
+                    # Low but nonzero: translation accuracy benefits from
+                    # favoring the most faithful rendering over creative
+                    # variety, but 0.0 can make the model overly terse or
+                    # drop nuance on some ASEAN languages in practice.
+                    temperature=0.2,
+                ))
         response = self._call_with_retry(request)
         translated = (response.text or "").strip()
         if not translated:

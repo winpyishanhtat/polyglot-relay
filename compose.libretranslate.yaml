@@ -39,11 +39,65 @@ x-free-worker: &free-worker
     TRANSLATION_BACKEND: ${TRANSLATION_BACKEND:-auto}
     LIBRETRANSLATE_URL: http://libretranslate:5000
     GEMINI_API_KEY: ${GEMINI_API_KEY:-insert your key}
-    GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-3.7-flash}
+    # Left unset by default (matching compose.real.yaml) so Translator.__init__'s
+    # own GEMINI_TIER-based default applies (gemini-pro-latest on paid,
+    # gemini-3.6-flash on free) instead of always pinning gemini-3.7-flash -
+    # confirmed on a real billing-enabled key that 3.7-flash's paid-tier quota
+    # grant can lag behind other models (see GEMINI_TIER note in .env.example),
+    # while pro-latest/flash-latest already reflect the paid tier correctly.
+    GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-}
+    # Only my/km/lo ever reach Gemini here (the other 6 stay on
+    # LibreTranslate), but this overlay previously never passed GEMINI_TIER
+    # through at all, so Translator.__init__ silently defaulted to "paid"
+    # while the key it was tested with was still genuinely free-tier -
+    # tripping the same 20/day cap this overlay exists to avoid. Defaults to
+    # "paid" here since billing was confirmed active on the project this was
+    # built against (Cloud Console: linked billing account, Pro-tier access
+    # working); override to "free" in your shell if testing against a key
+    # that isn't billing-enabled.
+    GEMINI_TIER: ${GEMINI_TIER:-paid}
+    # Also unwired before now: on paid tier this defaults to 0 (no stagger),
+    # which assumes the RPM ceiling absorbs a simultaneous burst - didn't
+    # hold up in practice for the 3 Gemini-dependent workers here (my/km/lo
+    # hitting the same model in the same instant tripped a FreeTier-labeled
+    # 429 that an isolated call never did). Passed through so a nonzero
+    # override in .env actually reaches the containers.
+    POLYGLOT_STAGGER_STEP_SECONDS: ${POLYGLOT_STAGGER_STEP_SECONDS:-}
+    # Also unwired before now: default is 5 retries with growing backoff
+    # (up to ~60s each), which can block a worker's queue for minutes on a
+    # genuinely exhausted shared quota - failing faster lets the next,
+    # fresher chunk get a turn instead of queuing behind a doomed retry.
+    GEMINI_MAX_RETRIES: ${GEMINI_MAX_RETRIES:-}
+    # Optional per-language key overrides: my/km/lo currently all draw on
+    # the single GEMINI_API_KEY above, so their daily quotas are one shared
+    # pool - the actual root cause of the contention documented above. Set
+    # these (each to a separate Google AI Studio key/project) to give each
+    # language its own independent quota instead. Harmless no-op on the
+    # other 6 workers, which never call Gemini at all.
+    GEMINI_API_KEY_MY: ${GEMINI_API_KEY_MY:-}
+    GEMINI_API_KEY_KM: ${GEMINI_API_KEY_KM:-}
+    GEMINI_API_KEY_LO: ${GEMINI_API_KEY_LO:-}
 
 services:
   demo-producer:
     profiles: [demo]
+
+  # Never wired to Gemini at all in this overlay before now: the dashboard's
+  # own audio upload/record endpoint (web_ui.py -> stt_service.transcribe_file)
+  # runs in this container, and its Gemini STT fallback for my/km/lo (see
+  # stt_service.py) silently found no API key and fell straight back to
+  # plain Whisper - reproducing the exact same garbled-transcription bug the
+  # fallback exists to fix, regardless of which language was selected in the
+  # dashboard. Only *adds* to the ui service's environment (the base
+  # compose.yaml entry keeps its own broker-address vars); Compose merges
+  # environment maps across files rather than replacing them.
+  ui:
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_API_KEY_MY: ${GEMINI_API_KEY_MY:-}
+      GEMINI_API_KEY_KM: ${GEMINI_API_KEY_KM:-}
+      GEMINI_API_KEY_LO: ${GEMINI_API_KEY_LO:-}
+      GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-}
 
   libretranslate:
     image: libretranslate/libretranslate:latest

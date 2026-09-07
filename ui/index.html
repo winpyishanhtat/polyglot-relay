@@ -30,7 +30,7 @@
         <div class="intro">
           <p class="eyebrow">Distributed speech intelligence</p>
           <h1 id="page-title">One voice.<br><em>Every&nbsp;channel.</em></h1>
-          <p class="lede" id="lede-text">Choose your language. Follow each speech chunk as two brokers coordinate eight independent translation channels.</p>
+          <p class="lede" id="lede-text">Choose your language. Follow each speech chunk as two brokers coordinate nine independent translation channels.</p>
           <div class="dial" id="channel-dial" role="img" aria-label="Live channel indicator"></div>
         </div>
 
@@ -66,7 +66,7 @@
           <form id="text-form">
             <label for="caption-text">Or try a short text chunk</label>
             <textarea id="caption-text" maxlength="2000" rows="2" placeholder="Type in your selected language…" required></textarea>
-            <button class="button primary" type="submit">Translate into 8 languages →</button>
+            <button class="button primary" type="submit">Translate into all 9 languages →</button>
           </form>
           <div class="composer-footer">
             <span id="composer-status">Upload a file or record to send a caption</span>
@@ -79,9 +79,8 @@
 
       <section class="pipeline panel" aria-labelledby="pipeline-title">
         <div class="section-heading"><h2 id="pipeline-title">Chunk journey</h2><span id="translation-progress" class="muted">Ready for input</span></div>
-        <div class="pipeline-steps"><span>01 · Upload / record</span><b>→</b><span>02 · Whisper chunks</span><b>→</b><span>03 · Leader routes</span><b>→</b><span>04 · Eight worker pools</span></div>
+        <div class="pipeline-steps"><span>01 · Upload / record</span><b>→</b><span>02 · Whisper chunks</span><b>→</b><span>03 · Leader routes</span><b>→</b><span>04 · Nine worker pools</span></div>
         <p id="media-progress" role="status">Each audio window becomes a numbered text chunk. Translations appear independently as workers finish.</p>
-        <p id="quota-note" class="quota-note">Free tier: concurrent pools share a request budget. Waiting is normal.</p>
         <div class="chunk-table-wrap"><table id="chunk-table"><caption class="sr-only">Translation status for each chunk and language</caption><thead></thead><tbody></tbody></table></div>
       </section>
 

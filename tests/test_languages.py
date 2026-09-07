@@ -336,6 +336,35 @@ class RetryLogicTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 1)
         sleep_mock.assert_not_called()
 
+    def test_call_with_retry_does_retry_a_perday_error_that_has_a_delay(self):
+        # Confirmed on a real billing-enabled key: a "PerDay"-labeled 429
+        # that also carries Google's own short retryDelay recovered on the
+        # very next attempt, unlike the delay-less case above which really
+        # doesn't clear for hours. Treating every "PerDay" label as
+        # unrecoverable was overly conservative and dropped translations
+        # that a single retry would have saved.
+        translator = Translator("en", mock=False)
+        translator.max_retries = 2
+        attempts = {"count": 0}
+
+        def perday_with_delay():
+            attempts["count"] += 1
+            if attempts["count"] < 2:
+                err = Exception(
+                    "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'details': "
+                    "[{'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'}, "
+                    "{'retryDelay': '13s'}]}}"
+                )
+                err.code = 429
+                raise err
+            return "ok"
+
+        with mock.patch("translator_worker.time.sleep") as sleep_mock:
+            result = translator._call_with_retry(perday_with_delay)
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts["count"], 2)
+        sleep_mock.assert_called_once()
+
 
 class LibreTranslateBackendTests(unittest.TestCase):
     """Covers the pluggable backend: LibreTranslate (free, self-hosted) is

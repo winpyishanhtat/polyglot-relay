@@ -84,7 +84,7 @@ function buildSourceSelect() {
     select.append(option);
   }
   const updateHint = () => {
-    hint.textContent = `${LANG_BY_CODE[select.value]?.name || "Selected language"} stays as the source transcript. The other eight channels translate each chunk.`;
+    hint.textContent = `${LANG_BY_CODE[select.value]?.name || "Selected language"} is captioned as-is in its own channel; the other 8 channels translate each chunk - all 9 channels update together.`;
     for (const card of document.querySelectorAll(".caption-card")) {
       card.classList.toggle("source-channel", card.dataset.lang === select.value);
     }
@@ -261,8 +261,8 @@ function renderNetwork(data) {
 
 function renderChunks(data) {
   const chunks = data.chunks || [];
-  const targets = chunks.flatMap(c => Object.values(c.targets).filter(t => t.status !== "source"));
-  const done = targets.filter(t => t.status === "completed").length;
+  const targets = chunks.flatMap(c => Object.values(c.targets));
+  const done = targets.filter(t => t.status === "completed" || t.status === "source").length;
   const failed = targets.filter(t => ["failed", "unavailable", "interrupted"].includes(t.status)).length;
   $("#translation-progress").textContent = `${chunks.length} chunk${chunks.length === 1 ? "" : "s"} · ${done}/${targets.length} translations done${failed ? ` · ${failed} need attention` : ""}`;
   const media = data.media || {status: "idle"};
@@ -270,11 +270,6 @@ function renderChunks(data) {
     : media.status === "failed" ? `Transcription failed: ${media.error}`
     : media.status === "transcribed" ? `Transcription finished: ${media.chunks} speech chunks. Watch the rows below for translation progress.`
     : "Upload a file, record then stop, or submit text. Each row follows one chunk across every channel.";
-  const settings = data.settings || {};
-  const members = data.brokers.find(b => b.leader && b.online)?.members || [];
-  const mockMode = members.length && members.every(m => m.mode === "mock");
-  $("#quota-note").textContent = mockMode ? `Mock demonstration · ${settings.chunk_seconds}s audio windows · Workers simulate translation without API requests. Use the Gemini Compose overlay for real translations.`
-    : `${settings.tier === "free" ? `Free tier · local budget ${settings.rpm} requests/min` : "Paid tier"} · ${settings.chunk_seconds}s audio windows · 8 translation requests per speech chunk. Results arrive independently; quota waits are expected.`;
   if (!uploadSending && (!mediaRecorder || mediaRecorder.state !== "recording")) {
     setComposerBusy(media.status === "transcribing", media.status === "transcribing" ? "Transcribing; follow chunk progress below" : undefined);
   }
@@ -527,7 +522,7 @@ $("#text-form").addEventListener("submit", async event => {
   try {
     await post("/api/captions", {text: $("#caption-text").value, source_lang: $("#source-lang").value});
     $("#caption-text").value = "";
-    showToast("Chunk queued for eight translation pools");
+    showToast("Chunk queued for all 9 language pools");
     refresh();
   } catch (error) { showToast(error.message); }
   finally { button.disabled = false; }

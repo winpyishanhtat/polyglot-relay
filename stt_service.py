@@ -7,6 +7,7 @@ import base64
 import logging
 import os
 import pathlib
+import re
 import sys
 import threading
 import time
@@ -97,6 +98,122 @@ def _pcm16(audio: Any) -> bytes:
     return (audio.clip(-1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 
+# Confirmed by direct testing (not a guess): Whisper cannot reliably
+# transcribe these three languages at any practical model size - `tiny`
+# produces confidently-wrong text in the wrong script entirely, and `small`
+# has such low confidence the hallucination filter drops it to nothing.
+# Gemini's own audio understanding, by contrast, transcribed the same
+# sample correctly (same model already used for translation on these three
+# languages) - so for exactly these languages, prefer sending the audio to
+# Gemini directly over trusting local Whisper at all. Only applies when the
+# caller already knows the source language (a concrete code, not "auto");
+# there is no way to pick this backend before transcribing unknown audio.
+_GEMINI_STT_LANGUAGES = frozenset({"my", "km", "lo"})
+
+
+def _pcm_window_to_wav_bytes(window: Any, sample_rate: int) -> bytes:
+    """Wrap a Whisper-loaded float32 audio window as an in-memory 16-bit PCM
+    WAV file - the format Gemini's generateContent audio input expects."""
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(_pcm16(window))
+    return buf.getvalue()
+
+
+def _transcribe_window_via_gemini(window: Any, sample_rate: int, language: str) -> str | None:
+    """Send one audio window straight to Gemini for transcription. Returns
+    None (never raises) on any failure - missing key, network error, empty
+    response - so the caller can fall back to Whisper's own attempt rather
+    than losing the chunk entirely."""
+    api_key = (
+        os.getenv(f"GEMINI_API_KEY_{language.upper()}")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+    )
+    if not api_key:
+        return None
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+
+        client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
+        model = os.getenv("GEMINI_TEXT_MODEL") or "gemini-flash-latest"
+        wav_bytes = _pcm_window_to_wav_bytes(window, sample_rate)
+        resp = client.models.generate_content(
+            model=model,
+            contents=[types.Content(parts=[
+                types.Part(text=(
+                    f"Transcribe the {config.language_label(language)} speech in this audio "
+                    "exactly, in its original script. Return only the transcription, with no "
+                    "explanation, labels, or quotes."
+                )),
+                types.Part(inline_data=types.Blob(data=wav_bytes, mime_type="audio/wav")),
+            ])],
+        )
+        text = (resp.text or "").strip()
+        return text or None
+    except Exception as exc:
+        LOG.warning("Gemini transcription failed for %s window (%s); falling back to Whisper", language, exc)
+        return None
+
+
+def _transcribe_window_via_gemini_auto(window: Any, sample_rate: int) -> tuple[str, str] | None:
+    """Recovery path for "Auto-detect" (language=None): triggered when
+    Whisper's own detected language lands outside our 9 supported codes
+    entirely - the exact signature both confirmed real Burmese failures
+    showed (Whisper mis-detected the language completely rather than
+    merely transcribing it poorly). A caller-specified language already
+    routes my/km/lo through _transcribe_window_via_gemini above and never
+    reaches here; this only covers the case where auto-detect itself picked
+    the wrong language before transcription could even start. Since we
+    don't know which language it actually is either, this asks Gemini to
+    identify it from the same 9-language set and transcribe in one call.
+    Returns None on any failure, so the caller keeps Whisper's (wrong) text
+    rather than losing the chunk entirely."""
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+
+        client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
+        model = os.getenv("GEMINI_TEXT_MODEL") or "gemini-flash-latest"
+        wav_bytes = _pcm_window_to_wav_bytes(window, sample_rate)
+        options = ", ".join(f"{code}={config.language_label(code)}" for code in config.TARGET_LANGUAGES)
+        resp = client.models.generate_content(
+            model=model,
+            contents=[types.Content(parts=[
+                types.Part(text=(
+                    f"Identify which of these languages is spoken in this audio: {options}. "
+                    "Then transcribe the speech exactly, in its original script. Reply with "
+                    "exactly two lines and nothing else:\nLANGUAGE: <matching code from the list>\n"
+                    "TEXT: <the transcription>"
+                )),
+                types.Part(inline_data=types.Blob(data=wav_bytes, mime_type="audio/wav")),
+            ])],
+        )
+        reply = (resp.text or "").strip()
+        lang_match = re.search(r"LANGUAGE:\s*(\w+)", reply)
+        text_match = re.search(r"TEXT:\s*(.+)", reply, re.DOTALL)
+        if not lang_match or not text_match:
+            return None
+        lang = lang_match.group(1).strip().lower()
+        text = text_match.group(1).strip()
+        if lang not in config.TARGET_LANGUAGES or not text:
+            return None
+        return text, lang
+    except Exception as exc:
+        LOG.warning("Gemini auto-detect recovery failed (%s); keeping Whisper's result", exc)
+        return None
+
+
 def _detect_text_language(text: str) -> tuple[str, float] | None:
     """Lightweight text-based language ID (py3langid - a small, self-
     contained statistical classifier, no network download beyond pip
@@ -144,7 +261,19 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
     window_samples = int(window_seconds * sample_rate)
     for offset in range(0, len(audio), window_samples):
         window = audio[offset:offset + window_samples]
+
+        # Whisper is unreliable for these three regardless of model size
+        # (confirmed by direct testing - see _GEMINI_STT_LANGUAGES above);
+        # try Gemini's own audio transcription first and only fall back to
+        # local Whisper if that's unavailable or fails.
+        if language in _GEMINI_STT_LANGUAGES:
+            gemini_text = _transcribe_window_via_gemini(window, sample_rate, language)
+            if gemini_text:
+                yield gemini_text, _pcm16(window), language
+                continue
+
         result = model.transcribe(window, fp16=False, condition_on_previous_text=False, language=language)
+        detected = result.get("language")
         pieces = []
         for segment in result.get("segments", []):
             text = str(segment.get("text", "")).strip()
@@ -154,8 +283,31 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
                 continue
             pieces.append(text)
         text = " ".join(pieces)
+
+        # In auto-detect mode, Whisper's language-ID and its actual decoder
+        # can disagree: confirmed by direct testing, Whisper correctly
+        # identified a Burmese sample as 'my' while its decoder still
+        # produced complete gibberish (mixed English/Chinese/Korean
+        # fragments) - the language head alone isn't a reliable enough
+        # signal that the transcription itself is trustworthy. Two cases:
+        # detected lands on one of the three known-weak languages (trust
+        # the language-ID, route to the same direct per-language Gemini
+        # path used when the caller specifies it up front); or detected
+        # falls outside our 9 supported codes entirely (Whisper got the
+        # language wrong too - ask Gemini to identify and transcribe from
+        # scratch). A caller-specified language never reaches here.
+        if language is None:
+            if detected in _GEMINI_STT_LANGUAGES:
+                gemini_text = _transcribe_window_via_gemini(window, sample_rate, detected)
+                if gemini_text:
+                    text = gemini_text
+            elif detected not in config.TARGET_LANGUAGES:
+                recovered = _transcribe_window_via_gemini_auto(window, sample_rate)
+                if recovered:
+                    text, detected = recovered
+
         if text:
-            yield text, _pcm16(window), result.get("language")
+            yield text, _pcm16(window), detected
 
 
 def transcribe_microphone(model_name: str, language: str | None = None) -> Iterator[tuple[str, bytes]]:

@@ -226,7 +226,6 @@ footer { width: min(1240px, calc(100% - 48px)); margin: 0 auto; padding: 0 0 36p
 .pipeline-steps span { padding: 12px 16px; border-radius: 9px; background: #e5ecd5; font-size: 13px; }
 .pipeline-steps span:last-child { background: #FFC85D; }
 .pipeline p { font-size: 13px; line-height: 1.7; }
-.quota-note { padding: 12px 16px; background: #ffedbf; border-left: 3px solid #bd8b2d; color: #66480d; }
 .chunk-table-wrap { overflow: auto; max-height: 420px; }
 #chunk-table { width: 100%; border-collapse: collapse; font-size: 11px; }
 #chunk-table th, #chunk-table td { padding: 12px 8px; border-bottom: 1px solid var(--line); text-align: left; }

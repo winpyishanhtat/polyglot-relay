@@ -19,6 +19,16 @@ services:
       target: full
     profiles: [tools]
     command: ["python", "stt_service.py", "--input-file", "/audio/input.wav", "--model", "tiny"]
+    environment:
+      # Previously unwired entirely, so stt_service.py's Gemini STT fallback
+      # for my/km/lo (Whisper is unreliable for these at any model size -
+      # confirmed by direct testing) silently never activated here: no key
+      # meant it always fell straight back to plain Whisper.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_API_KEY_MY: ${GEMINI_API_KEY_MY:-}
+      GEMINI_API_KEY_KM: ${GEMINI_API_KEY_KM:-}
+      GEMINI_API_KEY_LO: ${GEMINI_API_KEY_LO:-}
+      GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-}
     volumes:
       - type: bind
         source: ${AUDIO_FILE:?Set AUDIO_FILE to a WAV/audio file path}
