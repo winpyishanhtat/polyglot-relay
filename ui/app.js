@@ -266,11 +266,13 @@ function renderChunks(data) {
   const failed = targets.filter(t => ["failed", "unavailable", "interrupted"].includes(t.status)).length;
   $("#translation-progress").textContent = `${chunks.length} chunk${chunks.length === 1 ? "" : "s"} · ${done}/${targets.length} translations done${failed ? ` · ${failed} need attention` : ""}`;
   const media = data.media || {status: "idle"};
-  $("#media-progress").textContent = media.status === "transcribing" ? `Transcribing file… ${media.chunks} speech chunks sent so far. Earlier chunks are already in the pools.`
+  const live = data.live || {};
+  $("#media-progress").textContent = liveActive ? `Live: ${live.slices || 0} slice${live.slices === 1 ? "" : "s"} transcribed · ${live.chunks || 0} caption${live.chunks === 1 ? "" : "s"} sent${live.dropped ? ` · ${live.dropped} skipped (transcriber behind)` : ""}`
+    : media.status === "transcribing" ? `Transcribing file… ${media.chunks} speech chunks sent so far. Earlier chunks are already in the pools.`
     : media.status === "failed" ? `Transcription failed: ${media.error}`
     : media.status === "transcribed" ? `Transcription finished: ${media.chunks} speech chunks. Watch the rows below for translation progress.`
     : "Upload a file, record then stop, or submit text. Each row follows one chunk across every channel.";
-  if (!uploadSending && (!mediaRecorder || mediaRecorder.state !== "recording")) {
+  if (!uploadSending && !liveActive && (!mediaRecorder || mediaRecorder.state !== "recording")) {
     setComposerBusy(media.status === "transcribing", media.status === "transcribing" ? "Transcribing; follow chunk progress below" : undefined);
   }
   const head = document.createElement("tr");
@@ -385,7 +387,8 @@ function setComposerBusy(busy, statusText) {
   $("#record-button").disabled = busy;
   $("#audio-file-input").disabled = busy;
   $("#source-lang").disabled = busy;
-  $("#include-video").disabled = busy;
+  $("#include-video").disabled = busy || $("#live-mode").checked;
+  $("#live-mode").disabled = busy;
   $("#demo-button").disabled = busy;
   document.querySelector(".file-button").classList.toggle("is-disabled", busy);
   $("#composer-status").textContent = statusText || "Upload a file or record to send a caption";
@@ -442,6 +445,7 @@ function updateRecordTimer() {
 }
 
 async function startRecording() {
+  if ($("#live-mode").checked) return startLive();
   recordedSource = $("#source-lang").value;
   const includeVideo = $("#include-video").checked;
   let stream;
@@ -498,9 +502,121 @@ function stopRecording() {
   $("#record-button").classList.remove("recording");
 }
 
+// ---- live mode: captions while the speaker is still talking ---------------
+// Instead of one blob at Stop, the microphone is cut into short slices that
+// are each a complete, independently decodable file (a MediaRecorder only
+// writes its container header once, so cutting one recorder's output would
+// leave every slice after the first undecodable). A new recorder is started
+// before the previous one is stopped so no audio falls between slices.
+let liveActive = false;
+let liveTimer = null;
+let liveRecorder = null;
+let liveStream = null;
+let liveSource = "en";
+let liveMimeType = "";
+let liveSendChain = Promise.resolve();
+const LIVE_MIN_SLICE_MS = 700; // a shorter tail (e.g. at Stop) is mostly noise
+
+function startLiveSlice() {
+  const parts = [];
+  const startedAt = Date.now();
+  const recorder = liveMimeType ? new MediaRecorder(liveStream, { mimeType: liveMimeType }) : new MediaRecorder(liveStream);
+  recorder.addEventListener("dataavailable", (event) => { if (event.data.size) parts.push(event.data); });
+  recorder.addEventListener("stop", () => {
+    if (Date.now() - startedAt < LIVE_MIN_SLICE_MS) return;
+    const blob = new Blob(parts, { type: recorder.mimeType || "application/octet-stream" });
+    if (blob.size) sendLiveSlice(blob, liveSource);
+  });
+  recorder.start();
+  return recorder;
+}
+
+function rotateLiveSlice() {
+  const previous = liveRecorder;
+  liveRecorder = startLiveSlice();
+  if (previous && previous.state !== "inactive") previous.stop();
+}
+
+// Posts are chained so slices reach the server in the order they were
+// recorded; the server answers immediately, so the chain never stalls.
+function sendLiveSlice(blob, sourceLang) {
+  liveSendChain = liveSendChain.then(async () => {
+    try {
+      const response = await fetch(`/api/live/slice?source_lang=${encodeURIComponent(sourceLang)}`, {
+        method: "POST",
+        headers: { "Content-Type": blob.type || "application/octet-stream" },
+        body: blob,
+      });
+      if (response.status === 429) showToast("Live transcription is behind - a slice was skipped");
+      else if (!response.ok) showToast((await response.json().catch(() => ({}))).error || "Live slice failed");
+    } catch (error) {
+      showToast("Lost connection to the dashboard");
+    }
+  });
+}
+
+async function startLive() {
+  const sourceLang = $("#source-lang").value;
+  if (!LANGS.some((lang) => lang.code === sourceLang)) {
+    showToast("Select the spoken language before going live");
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (error) {
+    showToast("Microphone permission was denied");
+    return;
+  }
+  let sliceSeconds = 4;
+  try {
+    const status = await (await fetch("/api/status", { cache: "no-store" })).json();
+    sliceSeconds = status.settings.live_slice_seconds || sliceSeconds;
+  } catch (error) { /* keep the default */ }
+
+  liveActive = true;
+  liveStream = stream;
+  liveSource = sourceLang;
+  liveMimeType = pickRecorderMimeType(false);
+  liveRecorder = startLiveSlice();
+  liveTimer = setInterval(rotateLiveSlice, sliceSeconds * 1000);
+
+  for (const id of ["#source-lang", "#audio-file-input", "#include-video", "#live-mode", "#demo-button"]) $(id).disabled = true;
+  $("#composer-status").textContent = `Live - speak now; captions appear every ~${sliceSeconds}s`;
+  recordStartedAt = Date.now();
+  $("#record-timer").hidden = false;
+  updateRecordTimer();
+  recordTimerInterval = setInterval(updateRecordTimer, 250);
+  $("#record-label").textContent = "Stop";
+  $("#record-button").classList.add("recording");
+}
+
+function stopLive() {
+  liveActive = false;
+  clearInterval(liveTimer);
+  if (liveRecorder && liveRecorder.state !== "inactive") liveRecorder.stop(); // flushes the last slice
+  liveRecorder = null;
+  if (liveStream) {
+    for (const track of liveStream.getTracks()) track.stop();
+    liveStream = null;
+  }
+  clearInterval(recordTimerInterval);
+  $("#record-timer").hidden = true;
+  $("#record-label").textContent = "Record";
+  $("#record-button").classList.remove("recording");
+  setComposerBusy(false);
+}
+
+$("#live-mode").addEventListener("change", (event) => {
+  $("#include-video").disabled = event.target.checked;
+  if (event.target.checked) $("#include-video").checked = false;
+});
+
 $("#audio-file-input").addEventListener("change", handleFileUpload);
 $("#record-button").addEventListener("click", () => {
-  if (mediaRecorder && mediaRecorder.state === "recording") {
+  if (liveActive) {
+    stopLive();
+  } else if (mediaRecorder && mediaRecorder.state === "recording") {
     stopRecording();
   } else {
     startRecording();

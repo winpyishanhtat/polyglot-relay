@@ -30,6 +30,14 @@ STATIC_DIR = pathlib.Path(__file__).resolve().parent / "ui"
 # the dashboard has no CLI flags of its own for this).
 WHISPER_MODEL = os.getenv("POLYGLOT_WHISPER_MODEL", "base")
 MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_LIVE_SLICE_BYTES = 2 * 1024 * 1024
+# Slices waiting for the transcriber. Deliberately small: in a live session a
+# caption that arrives half a minute late is worse than a skipped slice.
+LIVE_QUEUE_SLICES = 3
+
+
+class LiveBacklogError(Exception):
+    """The live transcriber is saturated; the caller should skip, not retry."""
 
 
 class DashboardState:
@@ -40,6 +48,7 @@ class DashboardState:
         self.activity: deque[dict[str, Any]] = deque(maxlen=40)
         self.pending = 0
         self.media = {"status": "idle", "chunks": 0}
+        self.live = {"slices": 0, "chunks": 0, "dropped": 0, "queued": 0, "last_slice_at": None}
         self.chunks: dict[str, dict] = {}
         self.sequence = 0
         # The original (pre-translation) text for a chunk, keyed by
@@ -114,6 +123,7 @@ class DashboardState:
                 "activity": list(self.activity),
                 "pending": self.pending,
                 "media": dict(self.media),
+                "live": dict(self.live),
                 "chunks": json.loads(json.dumps(list(self.chunks.values()))),
                 "uptime": int(time.time() - self.started_at),
             }
@@ -124,6 +134,7 @@ class DashboardRuntime:
         self.state = DashboardState()
         self.stop_event = threading.Event()
         self.outbox: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=100)
+        self.live_queue: queue.Queue[tuple[bytes, str]] = queue.Queue(maxsize=LIVE_QUEUE_SLICES)
         self.producer = TranscriptProducer()
         self._media_lock = threading.Lock()
         self._last_leader = None
@@ -132,6 +143,7 @@ class DashboardRuntime:
         for lang in config.TARGET_LANGUAGES:
             threading.Thread(target=self._watch_language, args=(lang,), name=f"watch-{lang}", daemon=True).start()
         threading.Thread(target=self._send_loop, name="caption-sender", daemon=True).start()
+        threading.Thread(target=self._live_loop, name="live-transcriber", daemon=True).start()
         self.state.event("Dashboard connected to the relay network", "success")
 
     def submit(self, text: str, source_lang: str | None = None) -> None:
@@ -151,7 +163,8 @@ class DashboardRuntime:
         self.outbox.put((cleaned, source_lang))
         self.state.event("Caption queued for translation")
 
-    def submit_audio(self, data: bytes, source_lang: str | None = None) -> tuple[int, str | None]:
+    def submit_audio(self, data: bytes, source_lang: str | None = None,
+                     allow_empty: bool = False) -> tuple[int, str | None]:
         """Transcribe an uploaded/recorded audio-or-video blob with Whisper,
         in-process, and queue each resulting chunk exactly like submit().
         Returns (chunk count, the language Whisper actually detected - only
@@ -203,6 +216,8 @@ class DashboardRuntime:
                     self.state.media.update(chunks=count)
                 self.state.event(f"Audio chunk {count} transcribed and queued", "success")
             if not count:
+                if allow_empty:  # a silent live slice is normal, not an error
+                    return 0, None
                 raise ValueError("No speech detected in the uploaded audio")
             return count, detected_summary
         except SystemExit as exc:
@@ -232,6 +247,51 @@ class DashboardRuntime:
             finally:
                 self._media_lock.release()
         threading.Thread(target=process, name="upload-transcriber", daemon=True).start()
+
+    def enqueue_live_slice(self, data: bytes, source_lang: str | None) -> int:
+        """Accept one self-contained audio slice from a live browser session.
+
+        Returns immediately (the browser must not wait on Whisper). If the
+        transcriber is already behind, the slice is rejected rather than
+        queued without bound - see LIVE_QUEUE_SLICES.
+        """
+        if not data:
+            raise ValueError("Live audio slice is empty")
+        if source_lang not in config.LANGUAGES:
+            raise ValueError("Select the spoken language before going live")
+        try:
+            self.live_queue.put_nowait((data, source_lang))
+        except queue.Full:
+            with self.state._lock:
+                self.state.live["dropped"] += 1
+            self.state.event("Live transcription is behind; a slice was skipped", "warning")
+            raise LiveBacklogError("Transcriber is behind; slice skipped") from None
+        with self.state._lock:
+            self.state.live["queued"] = self.live_queue.qsize()
+        return self.live_queue.qsize()
+
+    def _live_loop(self) -> None:
+        # One consumer: slices are transcribed strictly in arrival order, and
+        # the shared media lock keeps Whisper from running two jobs at once.
+        while not self.stop_event.is_set():
+            try:
+                data, source_lang = self.live_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                with self._media_lock:
+                    count, _ = self.submit_audio(data, source_lang, allow_empty=True)
+                with self.state._lock:
+                    self.state.live["slices"] += 1
+                    self.state.live["chunks"] += count
+                    self.state.live["last_slice_at"] = time.time()
+            except Exception as exc:
+                LOG.warning("Live slice failed: %s", exc)
+                self.state.event(f"Live slice failed: {exc}", "error")
+            finally:
+                with self.state._lock:
+                    self.state.live["queued"] = self.live_queue.qsize()
+                self.live_queue.task_done()
 
     def run_demo(self) -> None:
         for sentence in DEMO_SENTENCES:
@@ -320,6 +380,7 @@ class DashboardRuntime:
         snapshot["brokers"] = brokers
         snapshot["settings"] = {"tier": os.getenv("GEMINI_TIER", "free"),
             "chunk_seconds": float(os.getenv("POLYGLOT_FILE_CHUNK_SECONDS", "15")),
+            "live_slice_seconds": max(2.0, min(10.0, float(os.getenv("POLYGLOT_LIVE_SLICE_SECONDS", "4")))),
             "rpm": int(os.getenv("GEMINI_RATE_LIMIT_PER_MINUTE", "5"))}
         return snapshot
 
@@ -390,6 +451,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 data = self._raw_body(MAX_AUDIO_UPLOAD_BYTES)
                 self.runtime.start_audio(data, source_lang)
                 return self._json({"accepted": True, "status": "transcribing"}, HTTPStatus.ACCEPTED)
+            if self.path.startswith("/api/live/slice"):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                source_lang = (query.get("source_lang", [None])[0]) or None
+                data = self._raw_body(MAX_LIVE_SLICE_BYTES)
+                queued = self.runtime.enqueue_live_slice(data, source_lang)
+                return self._json({"accepted": True, "queued": queued}, HTTPStatus.ACCEPTED)
             if self.path == "/api/demo":
                 self.runtime.run_demo()
                 return self._json({"accepted": True, "count": len(DEMO_SENTENCES)}, HTTPStatus.ACCEPTED)
@@ -397,6 +464,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.runtime.state.clear()
                 return self._json({"cleared": True})
             self.send_error(HTTPStatus.NOT_FOUND)
+        except LiveBacklogError as exc:
+            self._json({"error": str(exc), "dropped": True}, HTTPStatus.TOO_MANY_REQUESTS)
         except (ValueError, json.JSONDecodeError) as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 

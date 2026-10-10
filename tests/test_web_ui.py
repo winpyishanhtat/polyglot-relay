@@ -1,6 +1,7 @@
 import json
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -233,6 +234,126 @@ class AudioUploadTests(unittest.TestCase):
         handler.headers = {"Content-Length": str(MAX_AUDIO_UPLOAD_BYTES + 1)}
         with self.assertRaises(ValueError):
             handler._raw_body(MAX_AUDIO_UPLOAD_BYTES)
+
+
+class LiveStreamingTests(unittest.TestCase):
+    """Live mic streaming: the browser POSTs short self-contained audio
+    slices; a single worker transcribes them in order into the normal chunk
+    pipeline. Whisper is mocked, as in AudioUploadTests."""
+
+    def _runtime_with_consumer(self):
+        from web_ui import DashboardRuntime
+
+        runtime = DashboardRuntime()
+        thread = threading.Thread(target=runtime._live_loop, daemon=True)
+        thread.start()
+        return runtime, thread
+
+    def test_slices_are_transcribed_in_order_and_silence_is_not_an_error(self):
+        runtime, thread = self._runtime_with_consumer()
+        results = iter([iter([("first", b"", "th")]), iter([]), iter([("third", b"", "th")])])
+        submitted = []
+        try:
+            with mock.patch("web_ui.transcribe_file", side_effect=lambda *a, **k: next(results)),                  mock.patch.object(type(runtime), "submit", lambda self, text, lang=None: submitted.append((text, lang))):
+                for index in range(3):
+                    runtime.enqueue_live_slice(f"slice-{index}".encode(), "th")
+                    runtime.live_queue.join()  # keep arrival order unambiguous
+        finally:
+            runtime.stop_event.set()
+            thread.join(timeout=2)
+        self.assertEqual(submitted, [("first", "th"), ("third", "th")])
+        self.assertEqual(runtime.state.live["slices"], 3)
+        self.assertEqual(runtime.state.live["chunks"], 2)
+
+    def test_a_failing_slice_does_not_stop_later_slices(self):
+        runtime, thread = self._runtime_with_consumer()
+        outcomes = [RuntimeError("bad slice"), iter([("recovered", b"", "en")])]
+        submitted = []
+
+        def fake_transcribe(*_args, **_kwargs):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        try:
+            with mock.patch("web_ui.transcribe_file", side_effect=fake_transcribe),                  mock.patch.object(type(runtime), "submit", lambda self, text, lang=None: submitted.append(text)):
+                runtime.enqueue_live_slice(b"one", "en")
+                runtime.live_queue.join()
+                runtime.enqueue_live_slice(b"two", "en")
+                runtime.live_queue.join()
+        finally:
+            runtime.stop_event.set()
+            thread.join(timeout=2)
+        self.assertEqual(submitted, ["recovered"])
+
+    def test_saturated_transcriber_rejects_instead_of_queueing_without_bound(self):
+        from web_ui import LIVE_QUEUE_SLICES, DashboardRuntime, LiveBacklogError
+
+        runtime = DashboardRuntime()  # no consumer running: the queue only fills
+        for _ in range(LIVE_QUEUE_SLICES):
+            runtime.enqueue_live_slice(b"audio", "th")
+        with self.assertRaises(LiveBacklogError):
+            runtime.enqueue_live_slice(b"audio", "th")
+        self.assertEqual(runtime.state.live["dropped"], 1)
+        self.assertEqual(runtime.live_queue.qsize(), LIVE_QUEUE_SLICES)
+
+    def test_live_slice_requires_audio_and_a_concrete_language(self):
+        from web_ui import DashboardRuntime
+
+        runtime = DashboardRuntime()
+        for data, lang in [(b"", "th"), (b"audio", "auto"), (b"audio", None), (b"audio", "xx")]:
+            with self.assertRaises(ValueError):
+                runtime.enqueue_live_slice(data, lang)
+        self.assertEqual(runtime.live_queue.qsize(), 0)
+
+    def test_http_route_status_codes(self):
+        from web_ui import LIVE_QUEUE_SLICES, DashboardRuntime
+
+        runtime = DashboardRuntime()
+        previous = getattr(DashboardHandler, "runtime", None)
+        DashboardHandler.runtime = runtime
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def post(path, body):
+            request = urllib.request.Request(base + path, data=body, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as error:
+                return error.code, json.load(error)
+
+        try:
+            for _ in range(LIVE_QUEUE_SLICES):
+                status, payload = post("/api/live/slice?source_lang=my", b"audio")
+                self.assertEqual(status, 202)
+                self.assertTrue(payload["accepted"])
+            status, payload = post("/api/live/slice?source_lang=my", b"audio")
+            self.assertEqual(status, 429)
+            self.assertTrue(payload["dropped"])
+            self.assertEqual(post("/api/live/slice?source_lang=auto", b"audio")[0], 400)
+            self.assertEqual(post("/api/live/slice?source_lang=my", b"")[0], 400)
+            with urllib.request.urlopen(base + "/api/status", timeout=3) as response:
+                live = json.load(response)["live"]
+            self.assertEqual(live["dropped"], 1)
+            self.assertEqual(live["queued"], LIVE_QUEUE_SLICES)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            if previous is not None:
+                DashboardHandler.runtime = previous
+
+    def test_oversized_live_slice_is_rejected_from_content_length_alone(self):
+        from web_ui import MAX_LIVE_SLICE_BYTES
+
+        handler = DashboardHandler.__new__(DashboardHandler)
+        handler.headers = {"Content-Length": str(MAX_LIVE_SLICE_BYTES + 1)}
+        with self.assertRaises(ValueError):
+            handler._raw_body(MAX_LIVE_SLICE_BYTES)
 
 
 if __name__ == "__main__":
