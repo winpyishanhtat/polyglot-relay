@@ -14,6 +14,7 @@ from typing import Any
 
 from common import config
 from common.election import BullyElection
+from common.heartbeat import FailureDetector
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
 
 
@@ -316,20 +317,22 @@ class Broker:
                 self.registry.remove(worker.worker_id)
 
     def _leader_monitor(self) -> None:
-        failures_since = 0.0
+        # Wall-clock detector: a probe to a dead leader can itself block for
+        # CONNECT_TIMEOUT, so counting failed polls (one INTERVAL each) made
+        # detection take several times HEARTBEAT_TIMEOUT.
+        detector = FailureDetector(config.HEARTBEAT_TIMEOUT)
         while not self.stop_event.wait(config.HEARTBEAT_INTERVAL):
             if self.is_leader:
-                failures_since = 0.0
+                detector.seen()
                 continue
             leader_id = self.election.leader_id
             response = self._peer_request(leader_id, {"type": "heartbeat", "sender_id": self.broker_id, "role": "broker"}) if leader_id else None
             if response and response.get("is_leader"):
-                failures_since = 0.0
+                detector.seen()
                 continue
-            failures_since += config.HEARTBEAT_INTERVAL
-            if failures_since >= config.HEARTBEAT_TIMEOUT:
+            if detector.expired():
                 LOG.warning("Leader heartbeat timeout; triggering election")
-                failures_since = 0.0
+                detector.seen()
                 self.election.start()
 
     def _worker_reaper(self) -> None:
