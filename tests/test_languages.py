@@ -515,3 +515,32 @@ class EnglishPivotTranslationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedClientThreadSafetyTests(unittest.TestCase):
+    def test_concurrent_first_use_builds_one_client(self):
+        import threading
+        import time
+        from unittest import mock
+
+        import translator_worker
+
+        built = []
+
+        def slow_client(**kwargs):
+            time.sleep(0.05)
+            built.append(object())
+            return built[-1]
+
+        fake_genai = mock.Mock(Client=slow_client)
+        translator = translator_worker.Translator("en")
+        results = []
+        with mock.patch.dict("sys.modules", {"google": mock.Mock(genai=fake_genai), "google.genai": fake_genai}), \
+                mock.patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}):
+            threads = [threading.Thread(target=lambda: results.append(translator._get_client())) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(len(built), 1)
+        self.assertEqual(len({id(r) for r in results}), 1)

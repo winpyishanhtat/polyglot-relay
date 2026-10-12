@@ -158,6 +158,7 @@ def _libretranslate_get(url: str, timeout: float = 5.0):
 class Translator:
     def __init__(self, lang: str, mock: bool = False) -> None:
         self.lang, self.mock, self._client = lang, mock, None
+        self._client_lock = threading.Lock()
         self.report_status = lambda status, detail="": None
         # GEMINI_TIER picks the defaults below; it never overrides an
         # explicitly-set GEMINI_TEXT_MODEL / POLYGLOT_STAGGER_STEP_SECONDS.
@@ -232,6 +233,13 @@ class Translator:
             raise RuntimeError("Shared rate gate unavailable; Gemini request was not sent") from exc
 
     def _get_client(self):
+        # Locked: the dashboard shares one Translator across its pivot threads, and two
+        # threads each building a client would let the loser be garbage-collected (which
+        # closes it) while the other is mid-request: "client has been closed".
+        with self._client_lock:
+            return self._build_client()
+
+    def _build_client(self):
         if self._client is None:
             try:
                 from google import genai  # type: ignore
