@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ from common import config
 from common.discovery import discover_worker
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
 from stt_service import _GEMINI_STT_LANGUAGES as GEMINI_STT_LANGUAGES
-from stt_service import DEMO_SENTENCES, TranscriptProducer, transcribe_file
+from stt_service import DEMO_SENTENCES, TranscriptProducer, _load_whisper, transcribe_file
 from translator_worker import _LIBRETRANSLATE_NEVER_SUPPORTS as PIVOT_SOURCES
 from translator_worker import Translator
 
@@ -60,6 +61,45 @@ def live_slicing_settings() -> dict[str, int]:
     max_seconds = max(number("POLYGLOT_LIVE_MAX_SLICE_SECONDS", 8, 4, 15), min_seconds + 1)
     return {"min_ms": int(min_seconds * 1000), "max_ms": int(max_seconds * 1000),
             "pause_ms": int(number("POLYGLOT_LIVE_PAUSE_MS", 350, 150, 1000))}
+
+
+def access_token() -> str:
+    """Shared secret that every POST must carry (header X-Access-Token). Empty
+    leaves the dashboard open, as it always was; read per request so it can be set
+    without a code change."""
+    return os.getenv("POLYGLOT_ACCESS_TOKEN") or ""
+
+
+def rate_limit_per_minute() -> int:
+    """POSTs allowed per client address per minute; 0 disables the limit."""
+    return max(0, int(os.getenv("POLYGLOT_RATE_LIMIT_PER_MINUTE") or "240"))
+
+
+class RequestRateLimiter:
+    """Sliding one-minute window per client address. Anyone who can reach an
+    open dashboard can otherwise spend the owner's Gemini quota."""
+
+    def __init__(self, window_seconds: float = 60.0) -> None:
+        self.window_seconds = window_seconds
+        self._hits: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, client: str, limit: int) -> float:
+        """0.0 when the request may proceed, else the seconds until it could."""
+        if limit <= 0:
+            return 0.0
+        now = time.monotonic()
+        with self._lock:
+            hits = self._hits.setdefault(client, deque())
+            while hits and now - hits[0] >= self.window_seconds:
+                hits.popleft()
+            if len(hits) >= limit:
+                return max(0.1, self.window_seconds - (now - hits[0]))
+            hits.append(now)
+            if len(self._hits) > 4096:  # forget clients with nothing recent
+                for key in [k for k, v in self._hits.items() if not v or now - v[-1] >= self.window_seconds]:
+                    del self._hits[key]
+            return 0.0
 
 
 class LiveBacklogError(Exception):
@@ -185,7 +225,18 @@ class DashboardRuntime:
             threading.Thread(target=self._watch_language, args=(lang,), name=f"watch-{lang}", daemon=True).start()
         threading.Thread(target=self._send_loop, name="caption-sender", daemon=True).start()
         self.start_live_workers()
+        if os.getenv("POLYGLOT_PRELOAD_WHISPER", "1") != "0":
+            threading.Thread(target=self._preload_whisper, name="whisper-preload", daemon=True).start()
         self.state.event("Dashboard connected to the relay network", "success")
+
+    def _preload_whisper(self) -> None:
+        """Load the Whisper model now, not during the first speaker's first slice
+        (about 20s). Best effort: a missing install just means loading on demand."""
+        try:
+            _load_whisper(WHISPER_MODEL)
+            LOG.info("Whisper model %s is ready", WHISPER_MODEL)
+        except (Exception, SystemExit) as exc:
+            LOG.info("Whisper not preloaded (%s)", exc)
 
     def submit(self, text: str, source_lang: str | None = None) -> None:
         cleaned = " ".join(text.strip().split())
@@ -456,6 +507,10 @@ class DashboardRuntime:
     def _pivot_applies(self, source_lang: str | None) -> bool:
         if source_lang not in PIVOT_SOURCES or os.getenv("POLYGLOT_PIVOT", "1") == "0":
             return False
+        if os.getenv("TRANSLATION_BACKEND") == "gemini":
+            # Every worker translates straight from the original with Gemini, so a
+            # shared English rendering would only add a call and a wait.
+            return False
         try:
             return self._cluster_is_real()
         except Exception:  # an unreachable broker must not break sending
@@ -571,6 +626,7 @@ class DashboardRuntime:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     runtime: DashboardRuntime
+    limiter = RequestRateLimiter()
 
     def _json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -584,8 +640,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         if length > 10_000:
+            self._discard_body()
             raise ValueError("Request is too large")
         return json.loads(self.rfile.read(length) or b"{}")
+
+    def _discard_body(self, limit: int = 1_000_000) -> None:
+        """Read (and drop) up to `limit` bytes of the request body before refusing it.
+        Replying and closing while the client is still sending can reset the connection
+        before it ever sees the status line."""
+        try:
+            remaining = min(int(self.headers.get("Content-Length", "0")), limit)
+        except ValueError:
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                return
+            remaining -= len(chunk)
 
     def _raw_body(self, max_bytes: int) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))
@@ -620,7 +691,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _authorized(self) -> bool:
+        token = access_token()
+        if not token:
+            return True
+        supplied = self.headers.get("X-Access-Token", "")
+        return hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
+
     def do_POST(self) -> None:  # noqa: N802
+        if not self._authorized():
+            self._discard_body()
+            return self._json({"error": "Access token required"}, HTTPStatus.UNAUTHORIZED)
+        wait = self.limiter.allow(self.client_address[0], rate_limit_per_minute())
+        if wait:
+            self._discard_body()
+            payload = json.dumps({"error": "Too many requests; slow down"}).encode("utf-8")
+            self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Retry-After", str(int(wait) + 1))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         try:
             if self.path == "/api/captions":
                 body = self._body()

@@ -28,7 +28,9 @@ services:
       context: .
       target: mock
     command: ["python", "broker.py", "--id", "1"]
-    ports: ["7001:7001"]
+    # Loopback only: the broker protocol has no authentication. Anyone who can reach it can
+    # register as a worker and write captions on every viewer's screen.
+    ports: ["127.0.0.1:7001:7001"]
     healthcheck:
       test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7001"]
       interval: 2s
@@ -39,7 +41,7 @@ services:
   broker-2:
     <<: *app
     command: ["python", "broker.py", "--id", "2"]
-    ports: ["7002:7002"]
+    ports: ["127.0.0.1:7002:7002"]
     healthcheck:
       test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7002"]
       interval: 2s

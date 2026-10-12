@@ -85,18 +85,29 @@ _WHISPER_CACHE: dict[str, tuple[Any, Any]] = {}
 _WHISPER_CACHE_LOCK = threading.Lock()
 
 
-def _load_whisper(model_name: str):
+def _import_whisper():
+    try:
+        import whisper  # type: ignore
+    except ImportError as exc:
+        raise SystemExit("Whisper is not installed. Install requirements-stt.txt, or use --stdin.") from exc
+    return whisper
+
+
+def _load_whisper(model_name: str, need_model: bool = True):
     # Cached across calls in-process: the CLI only ever calls this once, but
     # web_ui.py's dashboard upload endpoint calls it once per request, and a
     # model load takes several seconds - reusing it matters there.
+    # need_model=False returns (whisper module, None): decoding audio needs only
+    # the module, so Burmese/Khmer/Lao (transcribed by Gemini) skip the ~20s model
+    # load - and do not queue behind another thread that is loading it.
+    if not need_model:
+        cached = _WHISPER_CACHE.get(model_name)
+        return cached if cached is not None else (_import_whisper(), None)
     with _WHISPER_CACHE_LOCK:
         cached = _WHISPER_CACHE.get(model_name)
         if cached is not None:
             return cached
-        try:
-            import whisper  # type: ignore
-        except ImportError as exc:
-            raise SystemExit("Whisper is not installed. Install requirements-stt.txt, or use --stdin.") from exc
+        whisper = _import_whisper()
         LOG.info("Loading Whisper model %s", model_name)
         loaded = (whisper, whisper.load_model(model_name))
         _WHISPER_CACHE[model_name] = loaded
@@ -134,6 +145,25 @@ def _pcm_window_to_wav_bytes(window: Any, sample_rate: int) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(_pcm16(window))
     return buf.getvalue()
+
+
+# A window shorter than this, or with no signal at all, holds nothing worth
+# sending: asking a speech model to transcribe a sliver of audio is how
+# invented words get into a caption.
+_MIN_WINDOW_SECONDS = 0.7
+_SILENCE_PEAK = 0.003
+
+
+def _window_is_unusable(window: Any, sample_rate: int) -> bool:
+    """True for a window too short, or too silent, to transcribe. Errs towards
+    sending: anything it cannot measure counts as usable."""
+    try:
+        minimum = float(os.getenv("POLYGLOT_MIN_WINDOW_SECONDS") or _MIN_WINDOW_SECONDS)
+        if len(window) < minimum * sample_rate:
+            return True
+        return float(abs(window).max()) < _SILENCE_PEAK
+    except Exception:
+        return False
 
 
 # Longest we will wait between Gemini transcription retries. A live slice is
@@ -174,7 +204,8 @@ def _transcribe_window_via_gemini(window: Any, sample_rate: int, language: str) 
             types.Part(text=(
                 f"Transcribe the {config.language_label(language)} speech in this audio "
                 "exactly, in its original script. Return only the transcription, with no "
-                "explanation, labels, or quotes."
+                "explanation, labels, or quotes. If the audio holds no clear speech, return "
+                "nothing at all - never guess or invent words."
             )),
             types.Part(inline_data=types.Blob(data=wav_bytes, mime_type="audio/wav")),
         ])]
@@ -287,7 +318,7 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
     Audio decoding still loads the file; this is incremental inference,
     not a streaming media decoder.
     """
-    whisper, model = _load_whisper(model_name)
+    whisper, model = _load_whisper(model_name, need_model=language not in _GEMINI_STT_LANGUAGES)
     audio = whisper.load_audio(str(path))
     sample_rate = whisper.audio.SAMPLE_RATE
     # condition_on_previous_text=False: Whisper's default feeds each
@@ -313,6 +344,8 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
         # gap: Whisper's attempt at these languages is fluent-looking
         # nonsense that would then be translated into eight other languages.
         if language in _GEMINI_STT_LANGUAGES:
+            if _window_is_unusable(window, sample_rate):
+                continue  # silence, not a failure: nothing to transcribe, nothing missed
             gemini_text = _transcribe_window_via_gemini(window, sample_rate, language)
             if gemini_text is None:
                 LOG.warning("Skipping a %s window: Gemini transcription unavailable", language)

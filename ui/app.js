@@ -1,4 +1,15 @@
 const $ = (selector) => document.querySelector(selector);
+
+// A dashboard protected with POLYGLOT_ACCESS_TOKEN is opened from a link ending
+// in ?token=...; it is remembered for this tab and sent with every change request.
+let accessToken = "";
+try {
+  accessToken = new URLSearchParams(window.location.search).get("token") || sessionStorage.getItem("polyglot-token") || "";
+  if (accessToken) sessionStorage.setItem("polyglot-token", accessToken);
+} catch (_) { /* no address bar or storage here: stay open */ }
+function authHeaders(headers = {}) {
+  return accessToken ? { ...headers, "X-Access-Token": accessToken } : headers;
+}
 const toast = $("#toast");
 let toastTimer;
 let lastCaptionSignature = "";
@@ -28,7 +39,7 @@ function showToast(message) {
 async function post(path, body = {}) {
   const response = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
   });
   const data = await response.json();
@@ -401,7 +412,7 @@ async function postAudio(blob, sourceLang, label) {
   try {
     const response = await fetch(`/api/captions/audio?source_lang=${encodeURIComponent(sourceLang)}`, {
       method: "POST",
-      headers: { "Content-Type": blob.type || "application/octet-stream" },
+      headers: authHeaders({ "Content-Type": blob.type || "application/octet-stream" }),
       body: blob,
     });
     const data = await response.json();
@@ -570,10 +581,11 @@ function sendLiveSlice(blob, sourceLang) {
     try {
       const response = await fetch(`/api/live/slice?source_lang=${encodeURIComponent(sourceLang)}`, {
         method: "POST",
-        headers: { "Content-Type": blob.type || "application/octet-stream" },
+        headers: authHeaders({ "Content-Type": blob.type || "application/octet-stream" }),
         body: blob,
       });
-      if (response.status === 429) showToast("Live transcription is behind - a slice was skipped");
+      if (response.status === 401) showToast("Access token required - open the dashboard from the link you were given");
+      else if (response.status === 429) showToast("Live transcription is behind - a slice was skipped");
       else if (!response.ok) showToast((await response.json().catch(() => ({}))).error || "Live slice failed");
     } catch (error) {
       showToast("Lost connection to the dashboard");

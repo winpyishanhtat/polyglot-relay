@@ -30,6 +30,10 @@ def listen(lang: str) -> None:
                     if message["type"] == "translated_chunk":
                         stamp = dt.datetime.fromtimestamp(float(message.get("timestamp", time.time()))).strftime("%H:%M:%S")
                         print(f"[{stamp}] {message['text']}", flush=True)
+            # A worker that closes the stream cleanly (restart, rebalance) used to be
+            # re-dialled immediately, in a tight loop; wait like the error path does.
+            LOG.warning("Worker closed the connection; finding another worker")
+            time.sleep(config.RECONNECT_DELAY)
         except (OSError, ConnectionError, ProtocolError) as exc:
             LOG.warning("Listener connection lost (%s); finding another worker", exc)
             time.sleep(config.RECONNECT_DELAY)

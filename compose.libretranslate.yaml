@@ -112,6 +112,15 @@ services:
       POLYGLOT_LIVE_MIN_SLICE_SECONDS: ${POLYGLOT_LIVE_MIN_SLICE_SECONDS:-}
       POLYGLOT_LIVE_MAX_SLICE_SECONDS: ${POLYGLOT_LIVE_MAX_SLICE_SECONDS:-}
       POLYGLOT_LIVE_PAUSE_MS: ${POLYGLOT_LIVE_PAUSE_MS:-}
+      # The dashboard skips the shared English rendering when every language goes
+      # straight to Gemini, so it needs to know the backend the workers use.
+      TRANSLATION_BACKEND: ${TRANSLATION_BACKEND:-auto}
+      # Public use: a shared secret every change request must carry (viewing stays
+      # open), a per-address request limit, and Whisper start-up / silence handling.
+      POLYGLOT_ACCESS_TOKEN: ${POLYGLOT_ACCESS_TOKEN:-}
+      POLYGLOT_RATE_LIMIT_PER_MINUTE: ${POLYGLOT_RATE_LIMIT_PER_MINUTE:-}
+      POLYGLOT_PRELOAD_WHISPER: ${POLYGLOT_PRELOAD_WHISPER:-}
+      POLYGLOT_MIN_WINDOW_SECONDS: ${POLYGLOT_MIN_WINDOW_SECONDS:-}
 
   libretranslate:
     image: libretranslate/libretranslate:latest
@@ -120,7 +129,8 @@ services:
     volumes:
       - lt-models:/home/libretranslate/.local
     networks: [relay]
-    ports: ["5001:5000"]
+    # Loopback only: this service has no authentication, so it must not be reachable from the network.
+    ports: ["127.0.0.1:5001:5000"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/languages', timeout=3)"]
