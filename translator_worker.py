@@ -188,7 +188,7 @@ class Translator:
         self.text_model = os.getenv("GEMINI_TEXT_MODEL") or default_text_model
         self.live_model = os.getenv("GEMINI_LIVE_MODEL") or "gemini-3.5-live-translate-preview"
         self.live_timeout = float(os.getenv("GEMINI_LIVE_TIMEOUT", "30"))
-        self.max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
+        self.max_retries = int(os.getenv("GEMINI_MAX_RETRIES") or "5")
         # "auto" (default): try the free LibreTranslate service first, fall
         # back to Gemini only for a language LibreTranslate doesn't have
         # loaded. "libretranslate": free only, never falls back (and raises
@@ -297,7 +297,8 @@ class Translator:
                 await asyncio.sleep(delay)
 
     def translate(self, text: str, audio_pcm_b64: str | None = None,
-                  audio_rate: int = 16000, source_lang: str | None = None) -> tuple[str, str]:
+                  audio_rate: int = 16000, source_lang: str | None = None,
+                  pivot_en: str | None = None) -> tuple[str, str]:
         # source_lang is the caption's spoken/typed language, if known:
         # None/"auto" means "let the translator detect it" (matches every
         # language this project shipped with before this option existed). A
@@ -316,9 +317,25 @@ class Translator:
                 raise ValueError(f"Gemini Live requires 16 kHz PCM; received {audio_rate} Hz")
             audio = base64.b64decode(audio_pcm_b64, validate=True)
             return asyncio.run(self._translate_live(audio, known_source)), "gemini-live"
-        if (self.backend_preference != "gemini"
-                and self.lang not in _LIBRETRANSLATE_NEVER_SUPPORTS
-                and self._libretranslate_supports_target()):
+        # LibreTranslate has no Burmese/Khmer/Lao model, so it cannot READ
+        # those either: asking it to translate FROM them just failed (after
+        # three retries, ~2.4s) before every worker fell back to Gemini.
+        source_unreadable = known_source in _LIBRETRANSLATE_NEVER_SUPPORTS
+        if source_unreadable and pivot_en:
+            # The sender already translated this once into English. Reuse it:
+            # the English pool needs no call at all, and every language
+            # LibreTranslate covers translates from English for free instead
+            # of each making its own Gemini call.
+            if self.lang == "en":
+                return pivot_en, "pivot"
+            if self._can_use_libretranslate():
+                try:
+                    return self._translate_via_libretranslate(pivot_en, "en"), "libretranslate-pivot"
+                except Exception as exc:
+                    if self.backend_preference == "libretranslate":
+                        raise
+                    LOG.warning("LibreTranslate pivot call failed (%s); falling back to Gemini", exc)
+        elif not source_unreadable and self._can_use_libretranslate():
             try:
                 return self._translate_via_libretranslate(text, known_source), "libretranslate"
             except Exception as exc:
@@ -326,11 +343,21 @@ class Translator:
                     raise
                 LOG.warning("LibreTranslate call failed (%s); falling back to Gemini", exc)
         if self.backend_preference == "libretranslate":
+            if source_unreadable:
+                raise RuntimeError(
+                    f"LibreTranslate cannot read the source language {known_source!r} and "
+                    "TRANSLATION_BACKEND=libretranslate forbids falling back to Gemini"
+                )
             raise RuntimeError(
                 f"LibreTranslate has no model loaded for {self.lang!r} and "
                 "TRANSLATION_BACKEND=libretranslate forbids falling back to Gemini"
             )
         return self._translate_text(text, known_source), "gemini-text"
+
+    def _can_use_libretranslate(self) -> bool:
+        return (self.backend_preference != "gemini"
+                and self.lang not in _LIBRETRANSLATE_NEVER_SUPPORTS
+                and self._libretranslate_supports_target())
 
     def _libretranslate_supports_target(self) -> bool:
         # Cache the answer for a minute rather than forever: LibreTranslate
@@ -505,6 +532,7 @@ class TranslatorWorker:
                 audio_pcm_b64=message.get("audio_pcm_b64"),
                 audio_rate=int(message.get("audio_rate", 16000)),
                 source_lang=message.get("source_lang"),
+                pivot_en=message.get("pivot_en"),
             )
             result = {"type": "translated_chunk", "chunk_id": message["chunk_id"], "lang": self.lang,
                       "text": translated, "timestamp": time.time(),

@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.parse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -24,6 +25,8 @@ from common.discovery import discover_worker
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
 from stt_service import _GEMINI_STT_LANGUAGES as GEMINI_STT_LANGUAGES
 from stt_service import DEMO_SENTENCES, TranscriptProducer, transcribe_file
+from translator_worker import _LIBRETRANSLATE_NEVER_SUPPORTS as PIVOT_SOURCES
+from translator_worker import Translator
 
 LOG = logging.getLogger("polyglot.ui")
 STATIC_DIR = pathlib.Path(__file__).resolve().parent / "ui"
@@ -36,12 +39,15 @@ MAX_LIVE_SLICE_BYTES = 2 * 1024 * 1024
 # Slices waiting for the transcriber. Deliberately small: in a live session a
 # caption that arrives half a minute late is worse than a skipped slice.
 LIVE_QUEUE_SLICES = 3
+# How long a chunk may wait for its shared English rendering before workers
+# are told to translate directly instead.
+PIVOT_TIMEOUT_SECONDS = float(os.getenv("POLYGLOT_PIVOT_TIMEOUT") or "25")
 # Slices transcribed at once. Gemini transcription is network-bound, so a few
 # in parallel keeps up with a speaker where one at a time falls behind.
-LIVE_WORKERS = max(1, min(6, int(os.getenv("POLYGLOT_LIVE_WORKERS", "3"))))
+LIVE_WORKERS = max(1, min(6, int(os.getenv("POLYGLOT_LIVE_WORKERS") or "3")))
 # Captions are released in speech order, so one stuck slice would stall all
 # later ones; after this long it is skipped (a gap) and the rest flow on.
-LIVE_MAX_HOLD_SECONDS = float(os.getenv("POLYGLOT_LIVE_MAX_HOLD_SECONDS", "20"))
+LIVE_MAX_HOLD_SECONDS = float(os.getenv("POLYGLOT_LIVE_MAX_HOLD_SECONDS") or "20")
 
 
 class LiveBacklogError(Exception):
@@ -145,6 +151,9 @@ class DashboardRuntime:
         self.outbox: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=100)
         self.live_queue: queue.Queue[tuple[int, bytes, str]] = queue.Queue(maxsize=LIVE_QUEUE_SLICES)
         self._whisper_lock = threading.Lock()  # Whisper inference is CPU-bound: one at a time
+        self._pivot_translator: Translator | None = None
+        self._pivot_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pivot")
+        self._pivot_cluster_checked: tuple[float, bool] = (0.0, False)
         # Live ordering: slices get a sequence number on arrival and are
         # released to the pipeline strictly in that order, however the
         # parallel workers happen to finish. Always take _live_lock before
@@ -405,7 +414,10 @@ class DashboardRuntime:
                 if source_lang in config.LANGUAGES:
                     self.state.add_caption({"lang": source_lang, "chunk_id": chunk_id,
                         "text": text, "translation_backend": "passthrough", "worker_id": "source"})
-                self.producer.send(text, chunk_id, source_lang=source_lang)
+                if self._pivot_applies(source_lang):
+                    self._send_in_two_stages(text, chunk_id, source_lang)
+                else:
+                    self.producer.send(text, chunk_id, source_lang=source_lang)
                 self.state.event("Caption sent to the leader broker", "success")
             except Exception as exc:
                 LOG.exception("Caption submission failed")
@@ -414,6 +426,69 @@ class DashboardRuntime:
                 with self.state._lock:
                     self.state.pending = max(0, self.state.pending - 1)
                 self.outbox.task_done()
+
+    def _cluster_is_real(self) -> bool:
+        """True when the English pool runs a real backend, not --mock. Cached
+        briefly: it is only a TCP round trip, but it sits on the send path."""
+        checked_at, value = self._pivot_cluster_checked
+        if time.monotonic() - checked_at < 10:
+            return value
+        value = False
+        for broker in self.broker_status():
+            if broker["online"] and broker["leader"]:
+                value = any(m.get("lang") == "en" and m.get("mode") != "mock"
+                            for m in broker.get("members", []))
+        self._pivot_cluster_checked = (time.monotonic(), value)
+        return value
+
+    def _pivot_applies(self, source_lang: str | None) -> bool:
+        if source_lang not in PIVOT_SOURCES or os.getenv("POLYGLOT_PIVOT", "1") == "0":
+            return False
+        try:
+            return self._cluster_is_real()
+        except Exception:  # an unreachable broker must not break sending
+            return False
+
+    def _send_in_two_stages(self, text: str, chunk_id: str, source_lang: str) -> None:
+        """Send a Burmese/Khmer/Lao caption without making anyone wait for the pivot.
+
+        LibreTranslate cannot read these languages, so every worker used to
+        make its own Gemini call (8 per chunk, all on one quota). Stage 1
+        goes out at once to the languages that need Gemini regardless
+        (my/km/lo); meanwhile ONE call translates the text to English. Stage 2
+        then sends English plus the five LibreTranslate languages with that
+        rendering attached, so they cost no Gemini call at all. If the pivot
+        fails or is slow, stage 2 goes out without it and workers translate
+        directly, exactly as before."""
+        gemini_only = sorted(PIVOT_SOURCES)
+        covered = [lang for lang in config.TARGET_LANGUAGES if lang not in PIVOT_SOURCES]
+        self.producer.send(text, chunk_id, source_lang=source_lang, targets=gemini_only)
+
+        def finish() -> None:
+            try:
+                pivot = self._pivot_to_english(text, source_lang)
+                self.producer.send(text, chunk_id, source_lang=source_lang, pivot_en=pivot, targets=covered)
+            except Exception as exc:
+                LOG.exception("Second stage of a chunk failed")
+                self.state.event(f"Caption partly failed: {exc}", "error")
+
+        threading.Thread(target=finish, name="pivot-stage-two", daemon=True).start()
+
+    def _pivot_to_english(self, text: str, source_lang: str | None) -> str | None:
+        """One shared English rendering of a caption, or None when the call
+        fails or exceeds PIVOT_TIMEOUT_SECONDS (workers then translate directly)."""
+        try:
+            def translate() -> str | None:
+                if self._pivot_translator is None:
+                    self._pivot_translator = Translator("en")
+                english, _backend = self._pivot_translator.translate(text, source_lang=source_lang)
+                return english.strip() or None
+
+            return self._pivot_pool.submit(translate).result(timeout=PIVOT_TIMEOUT_SECONDS)
+        except Exception as exc:
+            LOG.warning("English pivot unavailable (%s: %s); workers will translate directly", type(exc).__name__, exc)
+            self.state.event("English pivot unavailable; translating directly", "warning")
+            return None
 
     def _watch_language(self, lang: str) -> None:
         while not self.stop_event.is_set():
@@ -473,7 +548,7 @@ class DashboardRuntime:
         snapshot["brokers"] = brokers
         snapshot["settings"] = {"tier": os.getenv("GEMINI_TIER", "free"),
             "chunk_seconds": float(os.getenv("POLYGLOT_FILE_CHUNK_SECONDS", "15")),
-            "live_slice_seconds": max(2.0, min(10.0, float(os.getenv("POLYGLOT_LIVE_SLICE_SECONDS", "4")))),
+            "live_slice_seconds": max(2.0, min(10.0, float(os.getenv("POLYGLOT_LIVE_SLICE_SECONDS") or "4"))),
             "rpm": int(os.getenv("GEMINI_RATE_LIMIT_PER_MINUTE", "5"))}
         return snapshot
 

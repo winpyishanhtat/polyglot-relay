@@ -258,7 +258,13 @@ class Broker:
         conn.sendall(encode(response))
 
     def route_chunk(self, chunk: dict) -> None:
+        # Optional "targets": route only to these languages. A producer uses it
+        # to send one chunk in two stages (see web_ui's English pivot); a chunk
+        # without it goes to every language, exactly as before.
+        targets = chunk.get("targets")
         for lang in config.TARGET_LANGUAGES:
+            if targets is not None and lang not in targets:
+                continue
             if lang == chunk.get("source_lang"):
                 result = {**chunk, "type": "translated_chunk", "lang": lang,
                           "worker_id": f"broker-{self.broker_id}", "translation_backend": "passthrough"}

@@ -99,6 +99,12 @@ services:
       GEMINI_API_KEY_LO: ${GEMINI_API_KEY_LO:-}
       GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-}
       GEMINI_STT_MODEL: ${GEMINI_STT_MODEL:-}
+      # The dashboard translates Burmese/Khmer/Lao captions to English once
+      # (see POLYGLOT_PIVOT), so it needs the same tier-aware Gemini settings.
+      GEMINI_TIER: ${GEMINI_TIER:-paid}
+      GEMINI_MAX_RETRIES: ${GEMINI_MAX_RETRIES:-}
+      POLYGLOT_PIVOT: ${POLYGLOT_PIVOT:-}
+      POLYGLOT_PIVOT_TIMEOUT: ${POLYGLOT_PIVOT_TIMEOUT:-}
 
   libretranslate:
     image: libretranslate/libretranslate:latest

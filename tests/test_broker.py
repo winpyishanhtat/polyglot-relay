@@ -26,6 +26,38 @@ class BrokerRoutingTests(unittest.TestCase):
         self.assertEqual([f["chunk_id"] for f in en1.frames], ["0", "2"])
 
 
+class TargetFilterTests(unittest.TestCase):
+    """A chunk may name the languages it is for ("targets"), so a producer can
+    send it in two stages; a chunk without the field still goes to everyone."""
+
+    def _broker(self):
+        broker = Broker(1)
+        sockets = {lang: FakeSocket() for lang in ("en", "th", "km", "my")}
+        for index, (lang, sock) in enumerate(sockets.items()):
+            broker.registry.add(WorkerConnection(f"{lang}-1", lang, "localhost", index, sock))
+        return broker, sockets
+
+    def test_only_the_named_languages_receive_the_chunk(self):
+        broker, sockets = self._broker()
+        broker.route_chunk({"type": "transcript_chunk", "chunk_id": "1", "text": "x", "source_lang": "my",
+                            "targets": ["km", "my"]})
+        self.assertEqual({lang: len(s.frames) for lang, s in sockets.items()}, {"en": 0, "th": 0, "km": 1, "my": 1})
+        # the source language (my) is in targets, so it still gets its passthrough
+        self.assertEqual(sockets["my"].frames[0]["translation_backend"], "passthrough")
+
+    def test_the_source_passthrough_is_not_repeated_by_the_second_stage(self):
+        broker, sockets = self._broker()
+        broker.route_chunk({"type": "transcript_chunk", "chunk_id": "1", "text": "x", "source_lang": "my",
+                            "targets": ["en", "th"]})
+        self.assertEqual(len(sockets["my"].frames), 0)
+        self.assertEqual({lang: len(sockets[lang].frames) for lang in ("en", "th")}, {"en": 1, "th": 1})
+
+    def test_a_chunk_without_targets_still_goes_to_every_language(self):
+        broker, sockets = self._broker()
+        broker.route_chunk({"type": "transcript_chunk", "chunk_id": "1", "text": "x", "source_lang": "en"})
+        self.assertEqual({lang: len(s.frames) for lang, s in sockets.items() if lang != "en"}, {"th": 1, "km": 1, "my": 1})
+
+
 class LeaderMonitorTests(unittest.TestCase):
     def test_slow_dead_leader_probes_do_not_delay_election_beyond_the_timeout(self):
         # Each probe to the dead leader blocks 0.3s (like a connect timeout).

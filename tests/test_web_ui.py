@@ -477,5 +477,174 @@ class LiveParallelOrderingTests(unittest.TestCase):
         self.assertIn("Gemini transcription was unavailable", str(caught.exception))
 
 
+class EnglishPivotDashboardTests(unittest.TestCase):
+    """A Burmese/Khmer/Lao caption is sent in two stages: the Gemini-only
+    languages at once, and English plus the LibreTranslate languages once ONE
+    shared English rendering is ready (or without it if that fails or is slow).
+    Nothing here may block or break sending."""
+
+    def _runtime(self, *, real=True):
+        from web_ui import DashboardRuntime
+
+        runtime = DashboardRuntime()
+        runtime._cluster_is_real = lambda: real
+        runtime.producer = mock.Mock()
+        self.addCleanup(runtime._pivot_pool.shutdown, False)
+        self.addCleanup(runtime.stop_event.set)
+        return runtime
+
+    @staticmethod
+    def _with_translator(runtime, translate):
+        translator = mock.Mock()
+        translator.translate.side_effect = translate
+        runtime._pivot_translator = translator
+        return translator
+
+    @staticmethod
+    def _wait(condition, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _send(self, runtime, text="ဟာ", lang="my"):
+        runtime.outbox.put((text, lang))
+        thread = threading.Thread(target=runtime._send_loop, daemon=True)
+        thread.start()
+        return thread
+
+    # ---- when the pivot applies ------------------------------------------
+    def test_applies_only_to_sources_libretranslate_cannot_read(self):
+        runtime = self._runtime()
+        self.assertTrue(all(runtime._pivot_applies(lang) for lang in ("my", "km", "lo")))
+        self.assertFalse(any(runtime._pivot_applies(lang) for lang in ("en", "th", "id", "auto", None)))
+
+    def test_does_not_apply_against_a_mock_cluster(self):
+        self.assertFalse(self._runtime(real=False)._pivot_applies("my"))
+
+    def test_can_be_switched_off(self):
+        runtime = self._runtime()
+        with mock.patch.dict("os.environ", {"POLYGLOT_PIVOT": "0"}):
+            self.assertFalse(runtime._pivot_applies("my"))
+
+    def test_an_unreachable_broker_check_does_not_break_sending(self):
+        runtime = self._runtime()
+        runtime._cluster_is_real = mock.Mock(side_effect=OSError("no broker"))
+        self.assertFalse(runtime._pivot_applies("my"))
+
+    # ---- the pivot call itself ---------------------------------------------
+    def test_pivot_returns_stripped_english(self):
+        runtime = self._runtime()
+        translator = self._with_translator(runtime, lambda text, source_lang=None: (" I am about to eat ", "gemini-text"))
+        self.assertEqual(runtime._pivot_to_english("ဟာ", "my"), "I am about to eat")
+        translator.translate.assert_called_once_with("ဟာ", source_lang="my")
+
+    def test_a_failing_pivot_degrades_to_none_instead_of_raising(self):
+        runtime = self._runtime()
+
+        def boom(text, source_lang=None):
+            raise RuntimeError("503 UNAVAILABLE")
+
+        self._with_translator(runtime, boom)
+        self.assertIsNone(runtime._pivot_to_english("ဟာ", "my"))
+        self.assertTrue(any("pivot unavailable" in a["message"] for a in runtime.state.activity))
+
+    def test_a_slow_pivot_is_cut_off_at_the_timeout(self):
+        runtime = self._runtime()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self._with_translator(runtime, lambda text, source_lang=None: (release.wait(5) and "late", "gemini-text"))
+        with mock.patch("web_ui.PIVOT_TIMEOUT_SECONDS", 0.2):
+            started = time.monotonic()
+            self.assertIsNone(runtime._pivot_to_english("ဟာ", "my"))
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    # ---- the two-stage send ----------------------------------------------
+    def test_stage_one_goes_out_first_and_stage_two_carries_the_pivot(self):
+        from common import config
+
+        runtime = self._runtime()
+        self._with_translator(runtime, lambda text, source_lang=None: ("I am about to eat", "gemini-text"))
+        self._send(runtime)
+        self.assertTrue(self._wait(lambda: runtime.producer.send.call_count == 2))
+        first, second = [call.kwargs for call in runtime.producer.send.call_args_list]
+        self.assertEqual(first["targets"], ["km", "lo", "my"])
+        self.assertNotIn("pivot_en", first)
+        self.assertEqual(second["targets"], [lang for lang in config.TARGET_LANGUAGES if lang not in ("my", "km", "lo")])
+        self.assertEqual(second["pivot_en"], "I am about to eat")
+        # together the two stages cover every language exactly once
+        self.assertEqual(sorted(first["targets"] + second["targets"]), sorted(config.TARGET_LANGUAGES))
+
+    def test_a_slow_pivot_never_delays_stage_one(self):
+        runtime = self._runtime()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self._with_translator(runtime, lambda text, source_lang=None: (release.wait(5) and "late", "gemini-text"))
+        with mock.patch("web_ui.PIVOT_TIMEOUT_SECONDS", 0.4):
+            started = time.monotonic()
+            self._send(runtime)
+            self.assertTrue(self._wait(lambda: runtime.producer.send.call_count >= 1, 1.0))
+            self.assertLess(time.monotonic() - started, 0.35)  # stage one did not wait for the pivot
+            self.assertEqual(runtime.producer.send.call_args_list[0].kwargs["targets"], ["km", "lo", "my"])
+            self.assertTrue(self._wait(lambda: runtime.producer.send.call_count == 2))
+        second = runtime.producer.send.call_args_list[1].kwargs
+        self.assertIsNone(second["pivot_en"])               # timed out: workers translate directly
+        self.assertIn("en", second["targets"])               # ...and the second stage is still sent
+
+    def test_a_failing_pivot_still_sends_stage_two_without_it(self):
+        runtime = self._runtime()
+
+        def boom(text, source_lang=None):
+            raise RuntimeError("down")
+
+        self._with_translator(runtime, boom)
+        self._send(runtime)
+        self.assertTrue(self._wait(lambda: runtime.producer.send.call_count == 2))
+        self.assertIsNone(runtime.producer.send.call_args_list[1].kwargs["pivot_en"])
+
+    def test_other_sources_are_sent_once_to_everyone(self):
+        runtime = self._runtime()
+        self._send(runtime, "hello", "th")
+        self.assertTrue(self._wait(lambda: runtime.producer.send.call_count == 1))
+        time.sleep(0.2)
+        self.assertEqual(runtime.producer.send.call_count, 1)
+        self.assertNotIn("targets", runtime.producer.send.call_args.kwargs)
+
+
+class EmptyEnvironmentVariableTests(unittest.TestCase):
+    """Docker Compose passes unset ${VAR:-} settings as empty strings; every
+    numeric setting must treat "" as "use the default", not crash at import."""
+
+    def test_dashboard_imports_with_every_numeric_setting_empty(self):
+        import os
+        import subprocess
+        import sys
+
+        names = ["POLYGLOT_PIVOT_TIMEOUT", "POLYGLOT_LIVE_WORKERS", "POLYGLOT_LIVE_MAX_HOLD_SECONDS",
+                 "POLYGLOT_LIVE_SLICE_SECONDS", "GEMINI_MAX_RETRIES", "GEMINI_STT_MAX_RETRIES"]
+        env = {**os.environ, **{name: "" for name in names}}
+        code = ("import web_ui, translator_worker; "
+                "t = translator_worker.Translator('th'); "
+                "print(web_ui.PIVOT_TIMEOUT_SECONDS, web_ui.LIVE_WORKERS, web_ui.LIVE_MAX_HOLD_SECONDS, t.max_retries)")
+        done = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                              cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.split(), ["25.0", "3", "20.0", "5"])
+
+    def test_gemini_transcription_retries_accept_an_empty_setting(self):
+        from stt_service import _transcribe_window_via_gemini
+
+        generate = mock.Mock(side_effect=Exception("503 UNAVAILABLE"))
+        fake_genai = mock.MagicMock()
+        fake_genai.Client.return_value.models.generate_content = generate
+        modules = {"google": mock.MagicMock(genai=fake_genai), "google.genai": fake_genai,
+                   "google.genai.types": mock.MagicMock()}
+        with mock.patch.dict("os.environ", {"GEMINI_API_KEY": "k", "GEMINI_STT_MAX_RETRIES": ""}, clear=True),              mock.patch.dict("sys.modules", modules),              mock.patch("stt_service._pcm_window_to_wav_bytes", return_value=b"wav"),              mock.patch("stt_service.time.sleep"):
+            self.assertIsNone(_transcribe_window_via_gemini(object(), 16000, "my"))
+        self.assertEqual(generate.call_count, 3)  # the default of 2 retries
+
+
 if __name__ == "__main__":
     unittest.main()

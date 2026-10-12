@@ -33,6 +33,9 @@ DEMO_SENTENCES = [
 class TranscriptProducer:
     def __init__(self) -> None:
         self.sock: Any = None
+        # A chunk may be sent from two threads (see web_ui's two-stage send);
+        # one frame must never be interleaved with another on the socket.
+        self._send_lock = threading.Lock()
 
     def _connect(self) -> None:
         while self.sock is None:
@@ -45,7 +48,8 @@ class TranscriptProducer:
                 time.sleep(config.RECONNECT_DELAY)
 
     def send(self, text: str, chunk_id: str, audio_pcm: bytes | None = None,
-             audio_rate: int = 16000, source_lang: str | None = None) -> None:
+             audio_rate: int = 16000, source_lang: str | None = None,
+             pivot_en: str | None = None, targets: list[str] | None = None) -> None:
         message = {"type": "transcript_chunk", "chunk_id": chunk_id,
                    "text": text, "timestamp": time.time()}
         if audio_pcm:
@@ -53,18 +57,23 @@ class TranscriptProducer:
             message["audio_rate"] = audio_rate
         if source_lang:
             message["source_lang"] = source_lang
+        if pivot_en:
+            message["pivot_en"] = pivot_en  # one shared English rendering for workers to reuse
+        if targets is not None:
+            message["targets"] = list(targets)  # route to only these languages
         while True:
-            self._connect()
-            try:
-                self.sock.sendall(encode(message))
-                return
-            except OSError as exc:
-                LOG.warning("Send failed (%s); rediscovering leader", exc)
+            with self._send_lock:
+                self._connect()
                 try:
-                    self.sock.close()
-                except OSError:
-                    pass
-                self.sock = None
+                    self.sock.sendall(encode(message))
+                    return
+                except OSError as exc:
+                    LOG.warning("Send failed (%s); rediscovering leader", exc)
+                    try:
+                        self.sock.close()
+                    except OSError:
+                        pass
+                    self.sock = None
 
     def close(self) -> None:
         if self.sock:
@@ -173,7 +182,7 @@ def _transcribe_window_via_gemini(window: Any, sample_rate: int, language: str) 
         LOG.warning("Gemini transcription unavailable for %s (%s)", language, exc)
         return None
 
-    retries = max(0, int(os.getenv("GEMINI_STT_MAX_RETRIES", "2")))
+    retries = max(0, int(os.getenv("GEMINI_STT_MAX_RETRIES") or "2"))
     for attempt in range(retries + 1):
         try:
             resp = client.models.generate_content(model=model, contents=contents)

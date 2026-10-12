@@ -447,5 +447,71 @@ class LibreTranslateBackendTests(unittest.TestCase):
             self.assertTrue(translator._libretranslate_supports_target())
 
 
+class EnglishPivotTranslationTests(unittest.TestCase):
+    """LibreTranslate cannot read Burmese/Khmer/Lao. Without a pivot every
+    worker made its own Gemini call (8 per chunk); with the sender's shared
+    English rendering, only Gemini-only targets still need one."""
+
+    BURMESE = "ဟာ ထမင်းစားမလို့"
+
+    def _translate(self, lang, *, pivot, source="my", backend=None, lt_return="from-lt"):
+        translator = Translator(lang, mock=False)
+        if backend:
+            translator.backend_preference = backend
+        with mock.patch.object(translator, "_libretranslate_supports_target", return_value=True), \
+             mock.patch.object(translator, "_translate_via_libretranslate", return_value=lt_return) as lt, \
+             mock.patch.object(translator, "_translate_text", return_value="from-gemini") as gemini:
+            result = translator.translate(self.BURMESE, source_lang=source, pivot_en=pivot)
+        return result, lt, gemini
+
+    def test_english_pool_reuses_the_pivot_without_any_call(self):
+        result, lt, gemini = self._translate("en", pivot="I am about to eat")
+        self.assertEqual(result, ("I am about to eat", "pivot"))
+        lt.assert_not_called()
+        gemini.assert_not_called()
+
+    def test_libretranslate_languages_translate_from_the_english_pivot(self):
+        result, lt, gemini = self._translate("th", pivot="I am about to eat")
+        self.assertEqual(result, ("from-lt", "libretranslate-pivot"))
+        lt.assert_called_once_with("I am about to eat", "en")
+        gemini.assert_not_called()
+
+    def test_a_failing_pivot_call_falls_back_to_direct_gemini_from_the_original_text(self):
+        translator = Translator("th", mock=False)
+        with mock.patch.object(translator, "_libretranslate_supports_target", return_value=True), \
+             mock.patch.object(translator, "_translate_via_libretranslate", side_effect=RuntimeError("down")), \
+             mock.patch.object(translator, "_translate_text", return_value="from-gemini") as gemini:
+            result = translator.translate(self.BURMESE, source_lang="my", pivot_en="I am about to eat")
+        self.assertEqual(result, ("from-gemini", "gemini-text"))
+        gemini.assert_called_once_with(self.BURMESE, "my")
+
+    def test_gemini_only_targets_translate_directly_from_the_original(self):
+        for lang in ("km", "lo"):
+            result, lt, gemini = self._translate(lang, pivot="I am about to eat")
+            self.assertEqual(result, ("from-gemini", "gemini-text"))
+            lt.assert_not_called()
+            gemini.assert_called_once_with(self.BURMESE, "my")
+
+    def test_without_a_pivot_libretranslate_is_not_asked_to_read_burmese(self):
+        # The wasted-retries regression: it used to be tried (and fail) first.
+        result, lt, gemini = self._translate("th", pivot=None)
+        self.assertEqual(result, ("from-gemini", "gemini-text"))
+        lt.assert_not_called()
+
+    def test_a_readable_source_is_unchanged_and_ignores_any_pivot(self):
+        result, lt, gemini = self._translate("id", pivot="ignored", source="th")
+        self.assertEqual(result, ("from-lt", "libretranslate"))
+        lt.assert_called_once_with(self.BURMESE, "th")
+
+    def test_libretranslate_only_mode_refuses_an_unreadable_source_with_a_clear_error(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self._translate("th", pivot=None, backend="libretranslate")
+        self.assertIn("cannot read the source language", str(caught.exception))
+
+    def test_libretranslate_only_mode_still_uses_the_pivot(self):
+        result, _, _ = self._translate("th", pivot="I am about to eat", backend="libretranslate")
+        self.assertEqual(result[1], "libretranslate-pivot")
+
+
 if __name__ == "__main__":
     unittest.main()
