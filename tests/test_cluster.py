@@ -33,7 +33,10 @@ def request(port, message):
 class ClusterIntegrationTests(unittest.TestCase):
     def setUp(self):
         env = os.environ.copy()
-        env.update(POLYGLOT_BROKER_1_PORT=str(PORT1), POLYGLOT_BROKER_2_PORT=str(PORT2),
+        # This test starts its own brokers on localhost. Pin the hosts so it also passes inside the
+        # Compose test container, which sets them to the `broker-1` / `broker-2` service names.
+        env.update(POLYGLOT_BROKER_1_HOST="127.0.0.1", POLYGLOT_BROKER_2_HOST="127.0.0.1",
+                   POLYGLOT_BROKER_1_PORT=str(PORT1), POLYGLOT_BROKER_2_PORT=str(PORT2),
                    POLYGLOT_HEARTBEAT_INTERVAL="0.2", POLYGLOT_HEARTBEAT_TIMEOUT="0.6",
                    POLYGLOT_ELECTION_TIMEOUT="0.2", POLYGLOT_CONNECT_TIMEOUT="0.2")
         self.env = env
