@@ -50,6 +50,18 @@ LIVE_WORKERS = max(1, min(6, int(os.getenv("POLYGLOT_LIVE_WORKERS") or "3")))
 LIVE_MAX_HOLD_SECONDS = float(os.getenv("POLYGLOT_LIVE_MAX_HOLD_SECONDS") or "20")
 
 
+def live_slicing_settings() -> dict[str, int]:
+    """Limits the browser's pause-aware slicer works to (ui/live_slicer.js).
+    An empty variable (how Compose passes an unset one) means the default."""
+    def number(name: str, default: float, low: float, high: float) -> float:
+        return max(low, min(high, float(os.getenv(name) or default)))
+
+    min_seconds = number("POLYGLOT_LIVE_MIN_SLICE_SECONDS", 2, 1, 5)
+    max_seconds = max(number("POLYGLOT_LIVE_MAX_SLICE_SECONDS", 8, 4, 15), min_seconds + 1)
+    return {"min_ms": int(min_seconds * 1000), "max_ms": int(max_seconds * 1000),
+            "pause_ms": int(number("POLYGLOT_LIVE_PAUSE_MS", 350, 150, 1000))}
+
+
 class LiveBacklogError(Exception):
     """The live transcriber is saturated; the caller should skip, not retry."""
 
@@ -548,7 +560,7 @@ class DashboardRuntime:
         snapshot["brokers"] = brokers
         snapshot["settings"] = {"tier": os.getenv("GEMINI_TIER", "free"),
             "chunk_seconds": float(os.getenv("POLYGLOT_FILE_CHUNK_SECONDS", "15")),
-            "live_slice_seconds": max(2.0, min(10.0, float(os.getenv("POLYGLOT_LIVE_SLICE_SECONDS") or "4"))),
+            "live_slicing": live_slicing_settings(),
             "rpm": int(os.getenv("GEMINI_RATE_LIMIT_PER_MINUTE", "5"))}
         return snapshot
 
@@ -596,6 +608,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         route = "/index.html" if self.path == "/" else self.path.split("?", 1)[0]
         files = {"/index.html": ("index.html", "text/html; charset=utf-8"),
                  "/app.css": ("app.css", "text/css; charset=utf-8"),
+                 "/live_slicer.js": ("live_slicer.js", "text/javascript; charset=utf-8"),
                  "/app.js": ("app.js", "text/javascript; charset=utf-8")}
         if route not in files:
             return self.send_error(HTTPStatus.NOT_FOUND)

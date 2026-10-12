@@ -508,6 +508,10 @@ function stopRecording() {
 // writes its container header once, so cutting one recorder's output would
 // leave every slice after the first undecodable). A new recorder is started
 // before the previous one is stopped so no audio falls between slices.
+//
+// WHERE to cut is decided by LiveSlicer (live_slicer.js) from the microphone's
+// loudness: at a pause between phrases, never mid-word, and a slice with no
+// speech in it is not sent at all.
 let liveActive = false;
 let liveTimer = null;
 let liveRecorder = null;
@@ -515,7 +519,12 @@ let liveStream = null;
 let liveSource = "en";
 let liveMimeType = "";
 let liveSendChain = Promise.resolve();
+let liveAudioContext = null;
+let liveAnalyser = null;
+let liveLevels = null;
+let liveSlicer = null;
 const LIVE_MIN_SLICE_MS = 700; // a shorter tail (e.g. at Stop) is mostly noise
+const LIVE_LEVEL_POLL_MS = 50;
 
 function startLiveSlice() {
   const parts = [];
@@ -524,6 +533,7 @@ function startLiveSlice() {
   recorder.addEventListener("dataavailable", (event) => { if (event.data.size) parts.push(event.data); });
   recorder.addEventListener("stop", () => {
     if (Date.now() - startedAt < LIVE_MIN_SLICE_MS) return;
+    if (recorder.hadSpeech === false) return; // silence: nothing worth transcribing
     const blob = new Blob(parts, { type: recorder.mimeType || "application/octet-stream" });
     if (blob.size) sendLiveSlice(blob, liveSource);
   });
@@ -531,10 +541,26 @@ function startLiveSlice() {
   return recorder;
 }
 
-function rotateLiveSlice() {
+function rotateLiveSlice(hadSpeech) {
   const previous = liveRecorder;
   liveRecorder = startLiveSlice();
-  if (previous && previous.state !== "inactive") previous.stop();
+  if (previous && previous.state !== "inactive") {
+    previous.hadSpeech = hadSpeech;
+    previous.stop();
+  }
+}
+
+// One loudness reading (RMS, 0..1) of the most recent ~40ms of microphone audio.
+function currentLevel() {
+  liveAnalyser.getFloatTimeDomainData(liveLevels);
+  let sum = 0;
+  for (let i = 0; i < liveLevels.length; i++) sum += liveLevels[i] * liveLevels[i];
+  return Math.sqrt(sum / liveLevels.length);
+}
+
+function liveTick() {
+  const decision = liveSlicer.push(currentLevel(), performance.now());
+  if (decision.cut) rotateLiveSlice(decision.hadSpeech);
 }
 
 // Posts are chained so slices reach the server in the order they were
@@ -568,21 +594,31 @@ async function startLive() {
     showToast("Microphone permission was denied");
     return;
   }
-  let sliceSeconds = 4;
+  let limits = { min_ms: 2000, max_ms: 8000, pause_ms: 350 };
   try {
     const status = await (await fetch("/api/status", { cache: "no-store" })).json();
-    sliceSeconds = status.settings.live_slice_seconds || sliceSeconds;
-  } catch (error) { /* keep the default */ }
+    limits = status.settings.live_slicing || limits;
+  } catch (error) { /* keep the defaults */ }
 
   liveActive = true;
   liveStream = stream;
   liveSource = sourceLang;
   liveMimeType = pickRecorderMimeType(false);
+
+  liveAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+  liveAudioContext.resume();
+  liveAnalyser = liveAudioContext.createAnalyser();
+  liveAnalyser.fftSize = 2048; // ~43ms at 48kHz: back-to-back readings at the 50ms poll
+  liveAudioContext.createMediaStreamSource(stream).connect(liveAnalyser);
+  liveLevels = new Float32Array(liveAnalyser.fftSize);
+  liveSlicer = new LiveSlicer({ minMs: limits.min_ms, maxMs: limits.max_ms, pauseMs: limits.pause_ms });
+  liveSlicer.reset(performance.now());
+
   liveRecorder = startLiveSlice();
-  liveTimer = setInterval(rotateLiveSlice, sliceSeconds * 1000);
+  liveTimer = setInterval(liveTick, LIVE_LEVEL_POLL_MS);
 
   for (const id of ["#source-lang", "#audio-file-input", "#include-video", "#live-mode", "#demo-button"]) $(id).disabled = true;
-  $("#composer-status").textContent = `Live - speak now; captions appear every ~${sliceSeconds}s`;
+  $("#composer-status").textContent = "Live - speak now; captions follow each pause in your speech";
   recordStartedAt = Date.now();
   $("#record-timer").hidden = false;
   updateRecordTimer();
@@ -594,8 +630,15 @@ async function startLive() {
 function stopLive() {
   liveActive = false;
   clearInterval(liveTimer);
-  if (liveRecorder && liveRecorder.state !== "inactive") liveRecorder.stop(); // flushes the last slice
+  if (liveRecorder && liveRecorder.state !== "inactive") {
+    liveRecorder.hadSpeech = liveSlicer.hadSpeech; // the unfinished last slice, flushed now
+    liveRecorder.stop();
+  }
   liveRecorder = null;
+  if (liveAudioContext) {
+    liveAudioContext.close();
+    liveAudioContext = liveAnalyser = liveSlicer = liveLevels = null;
+  }
   if (liveStream) {
     for (const track of liveStream.getTracks()) track.stop();
     liveStream = null;
