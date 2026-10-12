@@ -1,0 +1,33 @@
+{
+  "settings": {
+    "POLYGLOT_HEARTBEAT_INTERVAL": 2.0,
+    "POLYGLOT_HEARTBEAT_TIMEOUT": 6.0,
+    "POLYGLOT_ELECTION_TIMEOUT": 2.0,
+    "POLYGLOT_CONNECT_TIMEOUT": 1.5
+  },
+  "recovery_seconds": [
+    8.125,
+    8.109,
+    8.093,
+    8.187,
+    8.125,
+    8.094,
+    8.14,
+    8.125,
+    8.11,
+    8.093
+  ],
+  "summary": {
+    "trials": 10,
+    "mean_seconds": 8.12,
+    "median_seconds": 8.118,
+    "min_seconds": 8.093,
+    "max_seconds": 8.187,
+    "stdev_seconds": 0.029,
+    "p95_seconds": 8.187,
+    "mean_ci95": [
+      8.106,
+      8.137
+    ]
+  }
+}
