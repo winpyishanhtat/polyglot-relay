@@ -40,8 +40,9 @@ docker compose --profile test build tests
 docker compose --profile test run --rm tests
 ```
 
-The expected result is `Ran 36 tests` followed by `OK` (the full-image SDK
-contract check is skipped in the lightweight mock image).
+The expected result is `Ran 486 tests` followed by `OK (skipped=55)`. The
+lightweight mock image has no numpy, Gemini SDK or Node, so the tests that need
+them are skipped there; run `python -m unittest discover -s tests` natively to run all of them.
 
 ## 3. Start the complete mock cluster
 

@@ -5,3 +5,5 @@ venv/
 eval/results.json
 eval/scenario_events.jsonl
 .env
+.coverage
+htmlcov/

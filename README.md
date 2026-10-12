@@ -91,8 +91,8 @@ Full Docker walkthrough — including a pure-Gemini overlay, worker-failure and 
 ├── web_ui.py + ui/            # Web dashboard — the primary way to run this
 ├── gemini_rate_gate.py         # Shared rate limiter for Gemini's free tier
 ├── common/                     # Protocol, election, heartbeat, discovery, config
-├── eval/                       # WER/BLEU evaluation harness
-├── tests/                      # 65-test unittest suite
+├── eval/                       # Metrics (CER/WER/chrF++ with bootstrap CIs), FLEURS-style runner, failover trials
+├── tests/                      # 400+ test suite (unittest + Node), ~93% line/branch coverage
 ├── Dockerfile, compose*.yaml   # Multi-stage build + overlays (mock / LibreTranslate+Gemini / pure Gemini)
 └── docs/DETAILS.md             # Full technical deep dive + report-ready sections
 ```
@@ -108,13 +108,78 @@ pip install -r requirements.txt
 
 You'll need a [Gemini API key](https://aistudio.google.com/apikey) (set via `GEMINI_API_KEY`), `ffmpeg` on your system, and either an audio file or a microphone. Three ways to get audio in: the web dashboard, `stt_service.py --input-file`, or live mic capture — see [docs/DETAILS.md](docs/DETAILS.md) for the full manual multi-terminal walkthrough and the mock-mode smoke test.
 
+## Running it for other people
+
+The defaults suit one person on one machine. Before others can reach it:
+
+1. Set `POLYGLOT_ACCESS_TOKEN` in `.env`. Anyone can then *watch* captions, but submitting text,
+   uploading audio, going live and clearing need the token (sent as `X-Access-Token`). Give the
+   presenter a link ending `?token=YOUR_TOKEN`; the page remembers it for that tab.
+2. Put an HTTPS reverse proxy (Caddy, nginx) in front of port 8000. Browsers only allow the
+   microphone on `https://` or `localhost`.
+3. Keep `POLYGLOT_RATE_LIMIT_PER_MINUTE` (default 240 changes per client address) and set a spend
+   cap and key restriction in Google Cloud. If the proxy hides client addresses, limit there too.
+4. The broker (7001/7002) and LibreTranslate (5001) ports are published on `127.0.0.1` only, because
+   the broker protocol has no authentication. Do not expose them.
+5. Audio and text are sent to the Gemini API: tell speakers and check Google's current terms for
+   your tier. Captions are held in memory only and are not written to disk.
+
+This is still one shared room per dashboard: everyone sees the same captions.
+
+## Evaluating it
+
+`eval/` measures quality on real recordings rather than synthesized speech. Build a manifest
+(one JSON object per line: `id`, `lang`, `audio`, `transcript`, optional `english`; FLEURS has this
+shape for Burmese, Khmer, Lao and the other languages here), then:
+
+```bash
+python -m eval.fleurs_eval asr --manifest data/manifest.jsonl --out results/asr.json
+python -m eval.fleurs_eval mt  --manifest data/manifest.jsonl --out results/mt.json --from-asr results/asr.json
+python -m eval.failover_trials --trials 30 --out results/failover.json
+```
+
+`asr` reports character and word error rate, empty outputs, seconds per clip and real-time factor;
+`mt` reports chrF++ against the human English translation. Both give 95% bootstrap intervals, and
+a clip that produced nothing scores as a total miss. chrF++ matches sacrebleu to 1e-14.
+`failover_trials` kills the leader N times and reports the distribution of time-to-new-leader
+(8.12 s, SD 0.03 s over 10 trials with the default 2 s heartbeat / 6 s timeout).
+
 ## Testing
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-or inside Docker: `docker compose --profile test run --rm tests`.
+or inside Docker: `docker compose --profile test run --rm tests`. The Docker image is stdlib-only, so
+tests that need numpy, the Gemini SDK or Node are skipped there (about 55 of 486); run the suite natively
+to execute everything.
+
+Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built-in runner
+(`node --test tests/js/app.test.js`; they are also part of the Python run when `node` is installed).
+
+| Area | Test files |
+|---|---|
+| Protocol, config, election, heartbeat, discovery, health check, listener client | `test_protocol.py`, `test_common_modules.py` |
+| Broker: registry, handshake, routing, job telemetry, reaper, leadership | `test_broker.py`, `test_broker_server.py`, `test_cluster.py` (real processes) |
+| Translator worker: retry rules, Gemini text/Live calls, LibreTranslate, English pivot, worker process | `test_languages.py`, `test_gemini_translation.py`, `test_worker_runtime.py` |
+| Speech-to-text: Whisper windows and filters, Gemini transcription, producer, CLI | `test_stt_service.py`, `test_stt_runtime.py`, `test_chunk_pipeline.py` |
+| Dashboard server: state, validation, listeners, broker status, HTTP routes, uploads, live slices | `test_web_ui.py`, `test_web_ui_extra.py` |
+| Dashboard page and live slicer (JavaScript) | `test_ui_app.py` + `tests/js/`, `test_live_slicer.py` |
+| Rate gate, evaluation metrics, evaluation runner, failover trials | `test_gemini_rate_gate.py`, `test_gate_and_eval.py`, `test_evaluation.py`, `test_eval_harness.py` |
+
+To see coverage: `pip install coverage`, then
+`python -m coverage run --branch --source=. --omit="tests/*,tools/*" -m unittest discover -s tests`
+and `python -m coverage report -m`.
+
+## License
+
+Released under the [MIT License](LICENSE). Anyone may use, copy, modify and distribute it, including
+commercially, as long as the copyright notice stays with it.
+
+It works with other software that has its own terms, none of which is bundled here:
+[LibreTranslate](https://github.com/LibreTranslate/LibreTranslate) (AGPL-3.0, run as a separate
+service over HTTP), OpenAI Whisper (MIT), the `google-genai` SDK (Apache-2.0), and the Google Gemini
+API, whose use is governed by Google's terms of service and your own API key.
 
 ---
 
