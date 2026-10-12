@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from typing import Any
 from common import config
 from common.discovery import discover_worker
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
+from stt_service import _GEMINI_STT_LANGUAGES as GEMINI_STT_LANGUAGES
 from stt_service import DEMO_SENTENCES, TranscriptProducer, transcribe_file
 
 LOG = logging.getLogger("polyglot.ui")
@@ -34,6 +36,12 @@ MAX_LIVE_SLICE_BYTES = 2 * 1024 * 1024
 # Slices waiting for the transcriber. Deliberately small: in a live session a
 # caption that arrives half a minute late is worse than a skipped slice.
 LIVE_QUEUE_SLICES = 3
+# Slices transcribed at once. Gemini transcription is network-bound, so a few
+# in parallel keeps up with a speaker where one at a time falls behind.
+LIVE_WORKERS = max(1, min(6, int(os.getenv("POLYGLOT_LIVE_WORKERS", "3"))))
+# Captions are released in speech order, so one stuck slice would stall all
+# later ones; after this long it is skipped (a gap) and the rest flow on.
+LIVE_MAX_HOLD_SECONDS = float(os.getenv("POLYGLOT_LIVE_MAX_HOLD_SECONDS", "20"))
 
 
 class LiveBacklogError(Exception):
@@ -48,7 +56,8 @@ class DashboardState:
         self.activity: deque[dict[str, Any]] = deque(maxlen=40)
         self.pending = 0
         self.media = {"status": "idle", "chunks": 0}
-        self.live = {"slices": 0, "chunks": 0, "dropped": 0, "queued": 0, "last_slice_at": None}
+        self.live = {"slices": 0, "chunks": 0, "dropped": 0, "unrecognized": 0, "late": 0,
+                     "queued": 0, "last_slice_at": None}
         self.chunks: dict[str, dict] = {}
         self.sequence = 0
         # The original (pre-translation) text for a chunk, keyed by
@@ -134,7 +143,18 @@ class DashboardRuntime:
         self.state = DashboardState()
         self.stop_event = threading.Event()
         self.outbox: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=100)
-        self.live_queue: queue.Queue[tuple[bytes, str]] = queue.Queue(maxsize=LIVE_QUEUE_SLICES)
+        self.live_queue: queue.Queue[tuple[int, bytes, str]] = queue.Queue(maxsize=LIVE_QUEUE_SLICES)
+        self._whisper_lock = threading.Lock()  # Whisper inference is CPU-bound: one at a time
+        # Live ordering: slices get a sequence number on arrival and are
+        # released to the pipeline strictly in that order, however the
+        # parallel workers happen to finish. Always take _live_lock before
+        # state._lock, never the reverse.
+        self._live_lock = threading.Lock()
+        self._live_seq = 0
+        self._live_next = 0
+        self._live_done: dict[int, list[tuple[str, str | None]]] = {}
+        self._live_started: dict[int, float] = {}
+        self._live_late: set[int] = set()
         self.producer = TranscriptProducer()
         self._media_lock = threading.Lock()
         self._last_leader = None
@@ -143,7 +163,7 @@ class DashboardRuntime:
         for lang in config.TARGET_LANGUAGES:
             threading.Thread(target=self._watch_language, args=(lang,), name=f"watch-{lang}", daemon=True).start()
         threading.Thread(target=self._send_loop, name="caption-sender", daemon=True).start()
-        threading.Thread(target=self._live_loop, name="live-transcriber", daemon=True).start()
+        self.start_live_workers()
         self.state.event("Dashboard connected to the relay network", "success")
 
     def submit(self, text: str, source_lang: str | None = None) -> None:
@@ -163,8 +183,42 @@ class DashboardRuntime:
         self.outbox.put((cleaned, source_lang))
         self.state.event("Caption queued for translation")
 
-    def submit_audio(self, data: bytes, source_lang: str | None = None,
-                     allow_empty: bool = False) -> tuple[int, str | None]:
+    def _transcribe_blob(self, data: bytes, source_lang: str | None, on_unrecognized=None):
+        """Yield (text, effective source language) for each speech window of an
+        audio-or-video blob, transcribed in this process. Callers validate
+        arguments first. Whisper runs one job at a time (it is CPU-bound);
+        Gemini-only languages (my/km/lo) are network-bound and run freely in
+        parallel."""
+        # A concrete source_lang (the dashboard's "Speaking in" dropdown,
+        # anything but "auto") is passed to Whisper too, not just attached
+        # as caption metadata - telling it the language up front skips its
+        # own detection pass entirely, which is both faster and more
+        # accurate than guessing, especially for languages Whisper is
+        # weaker at recognizing unprompted.
+        language_hint = source_lang if source_lang and source_lang != "auto" else None
+        guard = contextlib.nullcontext() if language_hint in GEMINI_STT_LANGUAGES else self._whisper_lock
+        with tempfile.NamedTemporaryFile(suffix=".media", delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = pathlib.Path(tmp.name)
+        try:
+            with guard:
+                for text, _pcm, detected_lang in transcribe_file(
+                        tmp_path, WHISPER_MODEL, language=language_hint, on_unrecognized=on_unrecognized):
+                    # Whisper's own per-file detection (only meaningful when
+                    # the dropdown was left on "auto") beats staying tagged
+                    # "auto" for the rest of the pipeline - it unlocks the
+                    # matching worker's passthrough and every other worker's
+                    # known-source Gemini prompt, instead of every worker
+                    # guessing independently. An explicit dropdown pick always
+                    # wins regardless, same as the language hint above.
+                    effective = source_lang
+                    if (not effective or effective == "auto") and detected_lang in config.LANGUAGES:
+                        effective = detected_lang
+                    yield text, effective
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def submit_audio(self, data: bytes, source_lang: str | None = None) -> tuple[int, str | None]:
         """Transcribe an uploaded/recorded audio-or-video blob with Whisper,
         in-process, and queue each resulting chunk exactly like submit().
         Returns (chunk count, the language Whisper actually detected - only
@@ -183,49 +237,36 @@ class DashboardRuntime:
             raise ValueError("Uploaded audio/video is empty")
         if source_lang and source_lang != "auto" and source_lang not in config.LANGUAGES:
             raise ValueError("Select one of the nine supported source languages")
-        # A concrete source_lang (the dashboard's "Speaking in" dropdown,
-        # anything but "auto") is passed to Whisper too, not just attached
-        # as caption metadata - telling it the language up front skips its
-        # own detection pass entirely, which is both faster and more
-        # accurate than guessing, especially for languages Whisper is
-        # weaker at recognizing unprompted.
-        language_hint = source_lang if source_lang and source_lang != "auto" else None
-        with tempfile.NamedTemporaryFile(suffix=".media", delete=False) as tmp:
-            tmp.write(data)
-            tmp_path = pathlib.Path(tmp.name)
+        gaps = 0
+
+        def note_gap() -> None:
+            nonlocal gaps
+            gaps += 1
+
         try:
-            chunks = transcribe_file(tmp_path, WHISPER_MODEL, language=language_hint)
             count = 0
             detected_summary: str | None = None
-            for text, _pcm, detected_lang in chunks:
-                # Whisper's own per-file detection (only meaningful when
-                # the dropdown was left on "auto") beats staying tagged
-                # "auto" for the rest of the pipeline - it unlocks the
-                # matching worker's passthrough and every other worker's
-                # known-source Gemini prompt, instead of every worker
-                # guessing independently. An explicit dropdown pick always
-                # wins regardless, same as the language hint above.
-                effective_source_lang = source_lang
-                if (not effective_source_lang or effective_source_lang == "auto") and detected_lang in config.LANGUAGES:
-                    effective_source_lang = detected_lang
-                    if detected_summary is None:
-                        detected_summary = detected_lang
+            for text, effective_source_lang in self._transcribe_blob(data, source_lang, note_gap):
+                if (detected_summary is None and (not source_lang or source_lang == "auto")
+                        and effective_source_lang != source_lang):
+                    detected_summary = effective_source_lang
                 self.submit(text, effective_source_lang)
                 count += 1
                 with self.state._lock:
                     self.state.media.update(chunks=count)
                 self.state.event(f"Audio chunk {count} transcribed and queued", "success")
+            if gaps:
+                self.state.event(f"{gaps} audio window(s) could not be transcribed because Gemini was "
+                                 "unavailable; those parts are missing", "warning")
             if not count:
-                if allow_empty:  # a silent live slice is normal, not an error
-                    return 0, None
+                if gaps:
+                    raise ValueError("Gemini transcription was unavailable, so no speech could be recognised; try again")
                 raise ValueError("No speech detected in the uploaded audio")
             return count, detected_summary
         except SystemExit as exc:
             raise ValueError(str(exc)) from exc
         except Exception as exc:
             raise ValueError(f"Could not transcribe upload: {exc}") from exc
-        finally:
-            tmp_path.unlink(missing_ok=True)
 
     def start_audio(self, data: bytes, source_lang: str | None) -> None:
         if not data or source_lang not in config.LANGUAGES:
@@ -251,47 +292,99 @@ class DashboardRuntime:
     def enqueue_live_slice(self, data: bytes, source_lang: str | None) -> int:
         """Accept one self-contained audio slice from a live browser session.
 
-        Returns immediately (the browser must not wait on Whisper). If the
-        transcriber is already behind, the slice is rejected rather than
-        queued without bound - see LIVE_QUEUE_SLICES.
+        Returns immediately (the browser must not wait on transcription). If
+        every worker is busy and the queue is full the slice is rejected
+        rather than queued without bound - see LIVE_QUEUE_SLICES.
         """
         if not data:
             raise ValueError("Live audio slice is empty")
         if source_lang not in config.LANGUAGES:
             raise ValueError("Select the spoken language before going live")
-        try:
-            self.live_queue.put_nowait((data, source_lang))
-        except queue.Full:
-            with self.state._lock:
-                self.state.live["dropped"] += 1
-            self.state.event("Live transcription is behind; a slice was skipped", "warning")
-            raise LiveBacklogError("Transcriber is behind; slice skipped") from None
+        with self._live_lock:
+            try:
+                self.live_queue.put_nowait((self._live_seq, data, source_lang))
+            except queue.Full:
+                with self.state._lock:
+                    self.state.live["dropped"] += 1
+                self.state.event("Live transcription is behind; a slice was skipped", "warning")
+                raise LiveBacklogError("Transcriber is behind; slice skipped") from None
+            self._live_seq += 1  # only consumed by slices that were actually queued
         with self.state._lock:
             self.state.live["queued"] = self.live_queue.qsize()
         return self.live_queue.qsize()
 
+    def start_live_workers(self, count: int | None = None) -> None:
+        for index in range(count or LIVE_WORKERS):
+            threading.Thread(target=self._live_loop, name=f"live-transcriber-{index}", daemon=True).start()
+
+    def _live_gap(self) -> None:
+        with self.state._lock:
+            self.state.live["unrecognized"] += 1
+        self.state.event("A live slice could not be transcribed (Gemini unavailable); expect a gap", "warning")
+
     def _live_loop(self) -> None:
-        # One consumer: slices are transcribed strictly in arrival order, and
-        # the shared media lock keeps Whisper from running two jobs at once.
         while not self.stop_event.is_set():
             try:
-                data, source_lang = self.live_queue.get(timeout=0.5)
+                seq, data, source_lang = self.live_queue.get(timeout=0.5)
             except queue.Empty:
+                with self._live_lock:  # lets a stuck slice time out even when nothing else is arriving
+                    self._live_release()
                 continue
+            with self._live_lock:
+                self._live_started[seq] = time.monotonic()
+            with self.state._lock:
+                self.state.live["queued"] = self.live_queue.qsize()
+            results: list[tuple[str, str | None]] = []
             try:
-                with self._media_lock:
-                    count, _ = self.submit_audio(data, source_lang, allow_empty=True)
-                with self.state._lock:
-                    self.state.live["slices"] += 1
-                    self.state.live["chunks"] += count
-                    self.state.live["last_slice_at"] = time.time()
-            except Exception as exc:
+                results = list(self._transcribe_blob(data, source_lang, self._live_gap))
+            except (Exception, SystemExit) as exc:
                 LOG.warning("Live slice failed: %s", exc)
                 self.state.event(f"Live slice failed: {exc}", "error")
             finally:
-                with self.state._lock:
-                    self.state.live["queued"] = self.live_queue.qsize()
+                with self._live_lock:
+                    self._live_finish(seq, results)
                 self.live_queue.task_done()
+
+    def _live_finish(self, seq: int, results: list[tuple[str, str | None]]) -> None:
+        """Record a finished slice, then release whatever is now in order.
+        Caller holds _live_lock."""
+        self._live_started.pop(seq, None)
+        if seq in self._live_late:
+            self._live_late.discard(seq)  # already skipped as too slow; drop the stale result
+        else:
+            self._live_done[seq] = results
+        self._live_release()
+
+    def _live_release(self) -> None:
+        """Hand finished slices to the pipeline strictly in arrival order.
+        Caller holds _live_lock."""
+        while True:
+            head = self._live_next
+            if head in self._live_done:
+                self._live_next += 1
+                submitted = 0
+                for text, lang in self._live_done.pop(head):
+                    try:
+                        self.submit(text, lang)
+                        submitted += 1
+                    except ValueError as exc:
+                        self.state.event(f"Live caption not sent: {exc}", "warning")
+                with self.state._lock:
+                    self.state.live["slices"] += 1
+                    self.state.live["chunks"] += submitted
+                    self.state.live["last_slice_at"] = time.time()
+            elif (head in self._live_started and any(seq > head for seq in self._live_done)
+                  and time.monotonic() - self._live_started[head] > LIVE_MAX_HOLD_SECONDS):
+                # Later slices are waiting on this one and it has taken too
+                # long: skip it (a gap) so live captions keep flowing.
+                self._live_started.pop(head)
+                self._live_late.add(head)
+                self._live_next += 1
+                with self.state._lock:
+                    self.state.live["late"] += 1
+                self.state.event("A live slice took too long and was skipped", "warning")
+            else:
+                return
 
     def run_demo(self) -> None:
         for sentence in DEMO_SENTENCES:

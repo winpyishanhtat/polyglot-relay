@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -182,7 +183,7 @@ class AudioUploadTests(unittest.TestCase):
         with mock.patch("web_ui.transcribe_file", return_value=iter([])) as transcribe:
             with self.assertRaises(ValueError):
                 runtime.submit_audio(b"fake-mp3-bytes", "th")
-        transcribe.assert_called_once_with(mock.ANY, mock.ANY, language="th")
+        transcribe.assert_called_once_with(mock.ANY, mock.ANY, language="th", on_unrecognized=mock.ANY)
 
     def test_auto_source_lang_passes_no_language_hint(self):
         from web_ui import DashboardRuntime
@@ -191,7 +192,7 @@ class AudioUploadTests(unittest.TestCase):
         with mock.patch("web_ui.transcribe_file", return_value=iter([])) as transcribe:
             with self.assertRaises(ValueError):
                 runtime.submit_audio(b"fake-mp3-bytes", "auto")
-        transcribe.assert_called_once_with(mock.ANY, mock.ANY, language=None)
+        transcribe.assert_called_once_with(mock.ANY, mock.ANY, language=None, on_unrecognized=mock.ANY)
 
     def test_empty_upload_rejected_before_transcription_is_attempted(self):
         from web_ui import DashboardRuntime
@@ -354,6 +355,126 @@ class LiveStreamingTests(unittest.TestCase):
         handler.headers = {"Content-Length": str(MAX_LIVE_SLICE_BYTES + 1)}
         with self.assertRaises(ValueError):
             handler._raw_body(MAX_LIVE_SLICE_BYTES)
+
+
+class LiveParallelOrderingTests(unittest.TestCase):
+    """Slices are transcribed in parallel (Gemini is network-bound) but their
+    captions must still reach the pipeline in the order they were spoken."""
+
+    def _start(self, workers):
+        from web_ui import DashboardRuntime
+
+        runtime = DashboardRuntime()
+        runtime.start_live_workers(workers)
+        submitted = []
+        runtime.submit = lambda text, lang=None: submitted.append(text)  # per instance, never class-wide
+        self.addCleanup(runtime.stop_event.set)
+        return runtime, submitted
+
+    @staticmethod
+    def _wait(condition, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_slices_run_in_parallel_but_captions_stay_in_speech_order(self):
+        delays = {b"s0": 0.9, b"s1": 0.3, b"s2": 0.5}  # distinct, so the finish order is deterministic
+        finished = []
+
+        def fake_transcribe(path, *_args, **_kwargs):
+            name = path.read_bytes()
+            time.sleep(delays[name])
+            finished.append(name)
+            return iter([(name.decode(), b"", "my")])
+
+        runtime, submitted = self._start(3)
+        started = time.monotonic()
+        with mock.patch("web_ui.transcribe_file", side_effect=fake_transcribe):
+            for name in (b"s0", b"s1", b"s2"):
+                runtime.enqueue_live_slice(name, "my")
+            self.assertTrue(self._wait(lambda: len(submitted) == 3))
+        elapsed = time.monotonic() - started
+        self.assertEqual(finished, [b"s1", b"s2", b"s0"])    # finished out of order...
+        self.assertEqual(submitted, ["s0", "s1", "s2"])      # ...released in speech order
+        self.assertLess(elapsed, 1.4)                        # sequential would take ~1.7s
+
+    def _max_concurrency(self, language):
+        active, peak, lock = [0], [0], threading.Lock()
+
+        def fake_transcribe(path, *_args, **_kwargs):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.25)
+            with lock:
+                active[0] -= 1
+            return iter([("text", b"", language)])
+
+        runtime, submitted = self._start(3)
+        with mock.patch("web_ui.transcribe_file", side_effect=fake_transcribe):
+            for index in range(4):
+                runtime.enqueue_live_slice(f"s{index}".encode(), language)
+                time.sleep(0.05)  # a browser sends one slice every few seconds, not four at once
+            self.assertTrue(self._wait(lambda: len(submitted) == 4))
+        return peak[0]
+
+    def test_gemini_only_languages_transcribe_in_parallel(self):
+        self.assertGreaterEqual(self._max_concurrency("my"), 2)
+
+    def test_whisper_languages_stay_serialized(self):
+        self.assertEqual(self._max_concurrency("th"), 1)
+
+    def test_a_stuck_slice_is_skipped_so_later_captions_still_flow(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def fake_transcribe(path, *_args, **_kwargs):
+            name = path.read_bytes()
+            if name == b"s0":
+                release.wait(5)
+            return iter([(name.decode(), b"", "my")])
+
+        runtime, submitted = self._start(3)
+        with mock.patch("web_ui.LIVE_MAX_HOLD_SECONDS", 0.4), \
+                mock.patch("web_ui.transcribe_file", side_effect=fake_transcribe):
+            for name in (b"s0", b"s1", b"s2"):
+                runtime.enqueue_live_slice(name, "my")
+            self.assertTrue(self._wait(lambda: submitted == ["s1", "s2"], 4), submitted)
+            self.assertEqual(runtime.state.live["late"], 1)
+            release.set()                                    # the stuck slice finally completes...
+            self.assertTrue(self._wait(lambda: not runtime._live_late))
+        self.assertEqual(submitted, ["s1", "s2"])           # ...and its stale caption is discarded
+
+    def test_unrecognized_slices_are_counted_as_gaps_not_errors(self):
+        def fake_transcribe(path, *_args, on_unrecognized=None, **_kwargs):
+            on_unrecognized()
+            return iter([])
+
+        runtime, submitted = self._start(1)
+        with mock.patch("web_ui.transcribe_file", side_effect=fake_transcribe):
+            runtime.enqueue_live_slice(b"s0", "my")
+            self.assertTrue(self._wait(lambda: runtime.state.live["slices"] == 1))
+        self.assertEqual(runtime.state.live["unrecognized"], 1)
+        self.assertEqual(runtime.state.live["chunks"], 0)
+        self.assertEqual(submitted, [])
+
+    def test_upload_where_every_window_failed_says_gemini_was_unavailable(self):
+        from web_ui import DashboardRuntime
+
+        runtime = DashboardRuntime()
+
+        def fake_transcribe(path, *_args, on_unrecognized=None, **_kwargs):
+            on_unrecognized()
+            on_unrecognized()
+            return iter([])
+
+        with mock.patch("web_ui.transcribe_file", side_effect=fake_transcribe):
+            with self.assertRaises(ValueError) as caught:
+                runtime.submit_audio(b"media", "my")
+        self.assertIn("Gemini transcription was unavailable", str(caught.exception))
 
 
 if __name__ == "__main__":

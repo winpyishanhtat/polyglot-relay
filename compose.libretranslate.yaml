@@ -98,6 +98,7 @@ services:
       GEMINI_API_KEY_KM: ${GEMINI_API_KEY_KM:-}
       GEMINI_API_KEY_LO: ${GEMINI_API_KEY_LO:-}
       GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-}
+      GEMINI_STT_MODEL: ${GEMINI_STT_MODEL:-}
 
   libretranslate:
     image: libretranslate/libretranslate:latest

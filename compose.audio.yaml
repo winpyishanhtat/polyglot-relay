@@ -29,6 +29,7 @@ services:
       GEMINI_API_KEY_KM: ${GEMINI_API_KEY_KM:-}
       GEMINI_API_KEY_LO: ${GEMINI_API_KEY_LO:-}
       GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-}
+      GEMINI_STT_MODEL: ${GEMINI_STT_MODEL:-}
     volumes:
       - type: bind
         source: ${AUDIO_FILE:?Set AUDIO_FILE to a WAV/audio file path}

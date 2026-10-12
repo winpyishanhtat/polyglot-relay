@@ -7,12 +7,13 @@ import base64
 import logging
 import os
 import pathlib
+import random
 import re
 import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from common import config
@@ -126,41 +127,71 @@ def _pcm_window_to_wav_bytes(window: Any, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+# Longest we will wait between Gemini transcription retries. A live slice is
+# only a few seconds long, so a long back-off is worse than a gap.
+_GEMINI_STT_MAX_BACKOFF = 6.0
+
+
 def _transcribe_window_via_gemini(window: Any, sample_rate: int, language: str) -> str | None:
-    """Send one audio window straight to Gemini for transcription. Returns
-    None (never raises) on any failure - missing key, network error, empty
-    response - so the caller can fall back to Whisper's own attempt rather
-    than losing the chunk entirely."""
+    """Send one audio window straight to Gemini for transcription.
+
+    Returns the transcript - "" when the window holds no speech - or None
+    when Gemini could not be reached (no key, SDK missing, or the call still
+    failing after bounded retries). None means "could not transcribe", and
+    the caller must NOT substitute Whisper for my/km/lo: it cannot recognise
+    them, and its fluent-looking nonsense would be translated into every
+    other language. Transient errors (503 overloaded, 429 rate limit,
+    dropped connections) are retried GEMINI_STT_MAX_RETRIES times (default
+    2) with a short capped back-off; a daily quota or a retry hint longer
+    than the cap is not worth waiting for. Never raises."""
     api_key = (
         os.getenv(f"GEMINI_API_KEY_{language.upper()}")
         or os.getenv("GEMINI_API_KEY")
         or os.getenv("GOOGLE_API_KEY")
     )
     if not api_key:
+        LOG.warning("No Gemini API key set; cannot transcribe a %s window", language)
         return None
     try:
         from google import genai  # type: ignore
         from google.genai import types  # type: ignore
 
+        from translator_worker import _is_daily_quota_exhausted, _is_retryable, _suggested_retry_delay
+
         client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
-        model = os.getenv("GEMINI_TEXT_MODEL") or "gemini-flash-latest"
+        model = os.getenv("GEMINI_STT_MODEL") or os.getenv("GEMINI_TEXT_MODEL") or "gemini-flash-latest"
         wav_bytes = _pcm_window_to_wav_bytes(window, sample_rate)
-        resp = client.models.generate_content(
-            model=model,
-            contents=[types.Content(parts=[
-                types.Part(text=(
-                    f"Transcribe the {config.language_label(language)} speech in this audio "
-                    "exactly, in its original script. Return only the transcription, with no "
-                    "explanation, labels, or quotes."
-                )),
-                types.Part(inline_data=types.Blob(data=wav_bytes, mime_type="audio/wav")),
-            ])],
-        )
-        text = (resp.text or "").strip()
-        return text or None
+        contents = [types.Content(parts=[
+            types.Part(text=(
+                f"Transcribe the {config.language_label(language)} speech in this audio "
+                "exactly, in its original script. Return only the transcription, with no "
+                "explanation, labels, or quotes."
+            )),
+            types.Part(inline_data=types.Blob(data=wav_bytes, mime_type="audio/wav")),
+        ])]
     except Exception as exc:
-        LOG.warning("Gemini transcription failed for %s window (%s); falling back to Whisper", language, exc)
+        LOG.warning("Gemini transcription unavailable for %s (%s)", language, exc)
         return None
+
+    retries = max(0, int(os.getenv("GEMINI_STT_MAX_RETRIES", "2")))
+    for attempt in range(retries + 1):
+        try:
+            resp = client.models.generate_content(model=model, contents=contents)
+            return (resp.text or "").strip()
+        except Exception as exc:
+            suggested = _suggested_retry_delay(exc)
+            hopeless = (_is_daily_quota_exhausted(exc) or not _is_retryable(exc)
+                        or (suggested is not None and suggested > _GEMINI_STT_MAX_BACKOFF))
+            if attempt == retries or hopeless:
+                LOG.warning("Gemini transcription failed for %s window (%s)", language, exc)
+                return None
+            delay = min(1.0 * 2 ** attempt + random.uniform(0, 1.0), _GEMINI_STT_MAX_BACKOFF)
+            if suggested is not None:
+                delay = max(delay, suggested)
+            LOG.warning("Gemini transcription for %s hit a transient error (%s); retry %s/%s in %.1fs",
+                        language, exc, attempt + 1, retries, delay)
+            time.sleep(delay)
+    return None  # pragma: no cover - the loop always returns
 
 
 def _transcribe_window_via_gemini_auto(window: Any, sample_rate: int) -> tuple[str, str] | None:
@@ -184,7 +215,7 @@ def _transcribe_window_via_gemini_auto(window: Any, sample_rate: int) -> tuple[s
         from google.genai import types  # type: ignore
 
         client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
-        model = os.getenv("GEMINI_TEXT_MODEL") or "gemini-flash-latest"
+        model = os.getenv("GEMINI_STT_MODEL") or os.getenv("GEMINI_TEXT_MODEL") or "gemini-flash-latest"
         wav_bytes = _pcm_window_to_wav_bytes(window, sample_rate)
         options = ", ".join(f"{code}={config.language_label(code)}" for code in config.TARGET_LANGUAGES)
         resp = client.models.generate_content(
@@ -234,8 +265,13 @@ def _detect_text_language(text: str) -> tuple[str, float] | None:
     return code, score
 
 
-def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = None) -> Iterator[tuple[str, bytes, str | None]]:
+def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = None,
+                    on_unrecognized: Callable[[], None] | None = None) -> Iterator[tuple[str, bytes, str | None]]:
     """Decode media once; yield one transcript per short inference window.
+
+    on_unrecognized is called once for each window of a Whisper-incapable
+    language (my/km/lo) that Gemini could not transcribe; that window is
+    skipped, leaving a gap rather than Whisper's nonsense.
 
     Translation can start before later windows have been transcribed.
     Windows may split sentences; 15 seconds balances context and latency.
@@ -264,13 +300,18 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
 
         # Whisper is unreliable for these three regardless of model size
         # (confirmed by direct testing - see _GEMINI_STT_LANGUAGES above);
-        # try Gemini's own audio transcription first and only fall back to
-        # local Whisper if that's unavailable or fails.
+        # use Gemini's own audio transcription. If it is unavailable, leave a
+        # gap: Whisper's attempt at these languages is fluent-looking
+        # nonsense that would then be translated into eight other languages.
         if language in _GEMINI_STT_LANGUAGES:
             gemini_text = _transcribe_window_via_gemini(window, sample_rate, language)
-            if gemini_text:
+            if gemini_text is None:
+                LOG.warning("Skipping a %s window: Gemini transcription unavailable", language)
+                if on_unrecognized:
+                    on_unrecognized()
+            elif gemini_text:
                 yield gemini_text, _pcm16(window), language
-                continue
+            continue
 
         result = model.transcribe(window, fp16=False, condition_on_previous_text=False, language=language)
         detected = result.get("language")
@@ -299,7 +340,11 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
         if language is None:
             if detected in _GEMINI_STT_LANGUAGES:
                 gemini_text = _transcribe_window_via_gemini(window, sample_rate, detected)
-                if gemini_text:
+                if gemini_text is None:
+                    text = ""  # Whisper's own text for this language is unreliable
+                    if on_unrecognized:
+                        on_unrecognized()
+                else:
                     text = gemini_text
             elif detected not in config.TARGET_LANGUAGES:
                 recovered = _transcribe_window_via_gemini_auto(window, sample_rate)

@@ -267,7 +267,7 @@ function renderChunks(data) {
   $("#translation-progress").textContent = `${chunks.length} chunk${chunks.length === 1 ? "" : "s"} · ${done}/${targets.length} translations done${failed ? ` · ${failed} need attention` : ""}`;
   const media = data.media || {status: "idle"};
   const live = data.live || {};
-  $("#media-progress").textContent = liveActive ? `Live: ${live.slices || 0} slice${live.slices === 1 ? "" : "s"} transcribed · ${live.chunks || 0} caption${live.chunks === 1 ? "" : "s"} sent${live.dropped ? ` · ${live.dropped} skipped (transcriber behind)` : ""}`
+  $("#media-progress").textContent = liveActive ? `Live: ${live.slices || 0} slice${live.slices === 1 ? "" : "s"} transcribed · ${live.chunks || 0} caption${live.chunks === 1 ? "" : "s"} sent${live.dropped ? ` · ${live.dropped} skipped (transcriber behind)` : ""}${live.unrecognized ? ` · ${live.unrecognized} not recognised (gap)` : ""}${live.late ? ` · ${live.late} too slow (gap)` : ""}`
     : media.status === "transcribing" ? `Transcribing file… ${media.chunks} speech chunks sent so far. Earlier chunks are already in the pools.`
     : media.status === "failed" ? `Transcription failed: ${media.error}`
     : media.status === "transcribed" ? `Transcription finished: ${media.chunks} speech chunks. Watch the rows below for translation progress.`
