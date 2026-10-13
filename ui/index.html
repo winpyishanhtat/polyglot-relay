@@ -108,10 +108,42 @@
       <section class="captions-section" aria-labelledby="captions-title">
         <div class="section-heading">
           <div><h2 id="captions-title">Live captions</h2></div>
-          <button id="clear-button" class="text-button" type="button">Clear captions</button>
+          <button id="clear-button" class="text-button" type="button">Clear captions &amp; history</button>
         </div>
         <div id="group-tabs" class="group-tabs" role="tablist" aria-label="Filter by language group"></div>
         <div class="caption-grid" id="caption-grid"></div>
+      </section>
+
+      <section class="history-section panel" aria-labelledby="history-title">
+        <div class="section-heading">
+          <div><h2 id="history-title">History</h2></div>
+          <span id="history-count" class="muted">Loading…</span>
+        </div>
+        <p class="history-intro">Everything said and translated stays here, even after it scrolls off the live captions. Pick a time frame, choose which languages to read, and export it.</p>
+        <div class="history-controls">
+          <label for="history-range">Show</label>
+          <select id="history-range" aria-label="Time frame"></select>
+          <span id="history-custom" class="history-custom" hidden>
+            <label for="history-from">from</label><input type="datetime-local" id="history-from" step="1">
+            <label for="history-to">to</label><input type="datetime-local" id="history-to" step="1">
+          </span>
+          <input type="search" id="history-search" placeholder="Search spoken or translated text" aria-label="Search the history" maxlength="200">
+          <label class="history-follow"><input type="checkbox" id="history-follow" checked> Follow live</label>
+        </div>
+        <div class="history-lang-row">
+          <span class="group-label">Languages</span>
+          <div id="history-langs" class="history-langs" role="group" aria-label="Languages to show"></div>
+          <button type="button" id="history-all" class="text-button">All</button>
+          <button type="button" id="history-none" class="text-button">Original only</button>
+        </div>
+        <div class="history-export">
+          <span class="group-label">Export this view</span>
+          <button type="button" class="button secondary" data-export="txt">Text</button>
+          <button type="button" class="button secondary" data-export="csv">Spreadsheet (CSV)</button>
+          <button type="button" class="button secondary" data-export="srt">Subtitles (SRT)</button>
+          <button type="button" class="button secondary" data-export="json">JSON</button>
+        </div>
+        <div id="history-list" class="history-list" role="log" aria-live="off" tabindex="0"><p class="empty">Nothing spoken yet.</p></div>
       </section>
 
       <section class="activity-section panel" aria-labelledby="activity-title">

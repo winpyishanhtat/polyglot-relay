@@ -179,6 +179,7 @@ function buildCaptionGrid() {
     const feed = document.createElement("div");
     feed.className = "caption-feed";
     feed.id = `captions-${lang.code}`;
+    feed.addEventListener("scroll", () => { feed.dataset.pinned = nearBottom(feed) ? "" : "1"; });
     const empty = document.createElement("p");
     empty.className = "empty";
     empty.textContent = EMPTY_COPY[lang.code] || DEFAULT_EMPTY_COPY;
@@ -323,7 +324,7 @@ function renderCaptions(captions, workers) {
       feed.replaceChildren(empty);
       continue;
     }
-    const elements = [...items].sort((a, b) => (a.number || 0) - (b.number || 0)).slice(-12).map((item) => {
+    const elements = [...items].sort((a, b) => (a.number || 0) - (b.number || 0)).map((item) => {
       const article = document.createElement("div");
       article.className = "caption-item";
       const text = document.createElement("p");
@@ -352,7 +353,11 @@ function renderCaptions(captions, workers) {
       article.append(meta);
       return article;
     });
+    // Follow the newest caption, unless the reader has scrolled up to read earlier ones.
+    const following = feed.dataset.pinned !== "1";
+    const before = feed.scrollTop || 0;
     feed.replaceChildren(...elements);
+    feed.scrollTop = following ? feed.scrollHeight : before;
   }
 }
 
@@ -699,11 +704,212 @@ $("#text-form").addEventListener("submit", async event => {
   finally { button.disabled = false; }
 });
 
+
+// ---- history: everything said, filterable by time frame, language and text -------------
+
+const HISTORY_RANGES = [["5", "Last 5 minutes"], ["15", "Last 15 minutes"], ["60", "Last hour"],
+  ["all", "Whole session"], ["custom", "Custom range"]];
+const HISTORY_ROWS = 500;
+const historyView = { range: "15", langs: new Set(["en"]), query: "", follow: true, searchTimer: null, loading: false };
+
+function localInputValue(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function historyParams(extra = {}) {
+  const params = new URLSearchParams();
+  if (historyView.range === "custom") {
+    const from = $("#history-from").value, to = $("#history-to").value;
+    if (from) params.set("since", String(new Date(from).getTime() / 1000));
+    if (to) params.set("until", String(new Date(to).getTime() / 1000));
+  } else if (historyView.range !== "all") {
+    params.set("last_minutes", historyView.range);
+  }
+  params.set("langs", LANGS.filter((l) => historyView.langs.has(l.code)).map((l) => l.code).join(","));
+  if (historyView.query) params.set("q", historyView.query);
+  for (const [key, value] of Object.entries(extra)) params.set(key, value);
+  return params;
+}
+
+function nearBottom(element) {
+  const height = element.scrollHeight || 0;
+  return height === 0 || height - (element.scrollTop || 0) - (element.clientHeight || 0) < 40;
+}
+
+function historyRow(row, now) {
+  const item = document.createElement("div");
+  item.className = "history-row";
+  item.dataset.chunk = row.chunk_id;
+  const meta = document.createElement("div");
+  meta.className = "history-meta";
+  const number = document.createElement("span");
+  number.className = "history-number";
+  number.textContent = row.number ? `#${row.number}` : "#–";
+  const time = document.createElement("span");
+  time.textContent = formatTime(row.created_at);
+  const spoken = document.createElement("span");
+  spoken.textContent = row.source_lang && row.source_lang !== "auto"
+    ? (LANG_BY_CODE[row.source_lang]?.name || row.source_lang) : "auto-detected";
+  meta.append(number, time, spoken);
+  const original = document.createElement("p");
+  original.className = row.text ? "history-original" : "history-original missing";
+  original.textContent = row.text || "(original not recorded)";
+  item.append(meta, original);
+  for (const lang of LANGS) {
+    if (!historyView.langs.has(lang.code)) continue;
+    const translation = row.translations[lang.code];
+    if (translation && lang.code === row.source_lang && translation.text === row.text) continue;  // the line above
+    const line = document.createElement("div");
+    line.className = "history-line";
+    const code = document.createElement("span");
+    code.className = "language-code";
+    code.textContent = lang.code.toUpperCase();
+    const text = document.createElement("span");
+    text.className = "history-text";
+    if (translation) {
+      text.textContent = translation.text;
+    } else {
+      text.className = "history-text pending";
+      text.textContent = now - row.created_at < 45 ? "translating…" : "no translation";
+    }
+    line.append(code, text);
+    if (translation && translation.backend && translation.backend !== "passthrough") {
+      const tag = document.createElement("small");
+      tag.className = `backend-tag backend-${translation.backend}`;
+      tag.textContent = translation.backend;
+      line.append(tag);
+    }
+    item.append(line);
+  }
+  return item;
+}
+
+function renderHistory(data) {
+  const list = $("#history-list");
+  const stick = historyView.follow && nearBottom(list);
+  const previous = list.scrollTop || 0;
+  if (!data.chunks.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = data.retained
+      ? "Nothing matches this time frame and search. Try a wider range."
+      : "Nothing spoken yet.";
+    list.replaceChildren(empty);
+  } else {
+    const now = data.server_time;
+    list.replaceChildren(...data.chunks.map((row) => historyRow(row, now)));
+  }
+  list.scrollTop = stick ? list.scrollHeight : previous;
+  $("#history-count").textContent = `${data.returned} of ${data.total} chunk${data.total === 1 ? "" : "s"}`
+    + (data.truncated ? ` · newest ${data.returned} shown` : "")
+    + ` · ${data.retained} kept (up to ${data.max_retained})`;
+}
+
+async function loadHistory() {
+  if (historyView.loading) return;
+  historyView.loading = true;
+  try {
+    const response = await fetch(`/api/history?${historyParams({ limit: HISTORY_ROWS })}`, { cache: "no-store" });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "History unavailable");
+    renderHistory(await response.json());
+  } catch (error) {
+    $("#history-count").textContent = error.message;
+  } finally {
+    historyView.loading = false;
+  }
+}
+
+function downloadName(response, fallback) {
+  const match = /filename="([^"]+)"/.exec((response.headers && response.headers.get && response.headers.get("Content-Disposition")) || "");
+  return match ? match[1] : fallback;
+}
+
+async function exportHistory(kind) {
+  const first = LANGS.find((l) => historyView.langs.has(l.code));
+  const extra = { format: kind };
+  if (kind === "srt") {
+    if (!first) { showToast("Choose a language to make subtitles in"); return; }
+    extra.lang = first.code;
+  }
+  try {
+    const response = await fetch(`/api/export?${historyParams(extra)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Export failed");
+    const blob = await response.blob();
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = downloadName(response, `polyglot-captions.${kind}`);
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 4000);
+    showToast(kind === "srt" ? `Subtitles saved (${first.name})` : "History exported");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function buildHistoryControls() {
+  const range = $("#history-range");
+  range.replaceChildren(...HISTORY_RANGES.map(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }));
+  range.value = historyView.range;
+  const chips = $("#history-langs");
+  const refreshChips = () => {
+    for (const chip of chips.children) chip.setAttribute("aria-pressed", String(historyView.langs.has(chip.dataset.lang)));
+  };
+  chips.replaceChildren(...LANGS.map((lang) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "history-chip";
+    chip.dataset.lang = lang.code;
+    chip.textContent = lang.name;
+    chip.addEventListener("click", () => {
+      if (historyView.langs.has(lang.code)) historyView.langs.delete(lang.code); else historyView.langs.add(lang.code);
+      refreshChips();
+      loadHistory();
+    });
+    return chip;
+  }));
+  refreshChips();
+  $("#history-all").addEventListener("click", () => { historyView.langs = new Set(LANGS.map((l) => l.code)); refreshChips(); loadHistory(); });
+  $("#history-none").addEventListener("click", () => { historyView.langs = new Set(); refreshChips(); loadHistory(); });
+  range.addEventListener("change", () => {
+    historyView.range = range.value;
+    $("#history-custom").hidden = range.value !== "custom";
+    if (range.value === "custom" && !$("#history-from").value) {
+      const now = new Date();
+      $("#history-from").value = localInputValue(new Date(now.getTime() - 15 * 60 * 1000));
+      $("#history-to").value = localInputValue(now);
+    }
+    loadHistory();
+  });
+  for (const id of ["#history-from", "#history-to"]) $(id).addEventListener("change", loadHistory);
+  $("#history-search").addEventListener("input", (event) => {
+    historyView.query = event.target.value.trim();
+    clearTimeout(historyView.searchTimer);
+    historyView.searchTimer = setTimeout(loadHistory, 250);
+  });
+  $("#history-follow").addEventListener("change", (event) => { historyView.follow = event.target.checked; });
+  for (const button of document.querySelectorAll("[data-export]")) {
+    button.addEventListener("click", () => exportHistory(button.dataset.export));
+  }
+  // Live ranges keep up with what is being said; a custom range stays put.
+  setInterval(() => { if (historyView.follow && historyView.range !== "custom") loadHistory(); }, 2000);
+  loadHistory();
+}
+
 $("#clear-button").addEventListener("click", async () => {
+  if (!confirm("Clear the live captions and the saved history? Export the history first if you need it.")) return;
   await post("/api/clear");
   lastCaptionSignature = "";
-  showToast("Caption history cleared");
+  showToast("Captions and history cleared");
   refresh();
+  loadHistory();
 });
 
 setInterval(() => { $("#clock").textContent = new Date().toLocaleTimeString(); }, 1000);
@@ -714,6 +920,7 @@ async function boot() {
   buildSourceSelect();
   buildGroupTabs();
   buildCaptionGrid();
+  buildHistoryControls();
   async function poll() { await refresh(); setTimeout(poll, 1000); }
   poll();
 }

@@ -15,12 +15,13 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import history as caption_history
 from common import config
 from common.discovery import discover_worker
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
@@ -125,6 +126,11 @@ class DashboardState:
         # plain dict has no cheap way to expire its oldest entries.
         self.originals: dict[str, dict[str, str]] = {}
         self._originals_order: deque[str] = deque(maxlen=200)
+        # Everything said and translated, kept far longer than the live feed (50 per language) so it
+        # can be scrolled, filtered by time and exported. Bounded by count, and optionally by age.
+        self.history: OrderedDict[str, dict] = OrderedDict()
+        self._history_max = max(10, int(os.getenv("POLYGLOT_HISTORY_CHUNKS") or "2000"))
+        self._history_max_age = max(0.0, float(os.getenv("POLYGLOT_HISTORY_MINUTES") or "0")) * 60
         self._lock = threading.RLock()
 
     def event(self, message: str, kind: str = "info") -> None:
@@ -140,10 +146,59 @@ class DashboardState:
             self.originals[chunk_id] = {"text": text, "source_lang": source_lang or "auto"}
             self._originals_order.append(chunk_id)
             self.sequence += 1
+            now = time.time()
+            row = self._history_row(chunk_id, now)
+            row.update(number=self.sequence, text=text, source_lang=source_lang or "auto", created_at=now)
+            self._trim_history(now)
             self.chunks[chunk_id] = {"chunk_id": chunk_id, "number": self.sequence,
-                "text": text, "source_lang": source_lang, "created_at": time.time(),
+                "text": text, "source_lang": source_lang, "created_at": now,
                 "targets": {lang: {"status": "source" if lang == source_lang else "awaiting_broker"}
                             for lang in config.TARGET_LANGUAGES}}
+
+    def _history_row(self, chunk_id: str, created_at: float) -> dict:
+        row = self.history.get(chunk_id)
+        if row is None:
+            row = {"chunk_id": chunk_id, "number": None, "created_at": created_at, "text": None,
+                   "source_lang": None, "translations": {}}
+            self.history[chunk_id] = row
+        return row
+
+    def _trim_history(self, now: float) -> None:
+        while len(self.history) > self._history_max:
+            self.history.popitem(last=False)
+        if self._history_max_age:
+            while self.history:
+                oldest = next(iter(self.history.values()))
+                if now - oldest["created_at"] <= self._history_max_age:
+                    break
+                self.history.popitem(last=False)
+
+    def query_history(self, since: float | None = None, until: float | None = None,
+                      langs: list[str] | None = None, query: str | None = None, limit: int = 200,
+                      last_minutes: float | None = None) -> dict[str, Any]:
+        """Chunks in a time window, oldest first, with only the requested languages' translations.
+        When more than `limit` match, the newest `limit` are returned and truncated is true."""
+        now = time.time()
+        if last_minutes is not None:
+            since = now - last_minutes * 60
+        wanted = [code for code in (langs or config.TARGET_LANGUAGES) if code in config.LANGUAGES]
+        needle = (query or "").strip().casefold()
+        with self._lock:
+            matching = []
+            for row in self.history.values():
+                if (since is not None and row["created_at"] < since) or (until is not None and row["created_at"] > until):
+                    continue
+                shown = {code: dict(row["translations"][code]) for code in wanted if code in row["translations"]}
+                if needle:
+                    haystack = " ".join([row["text"] or "", *[t["text"] for t in shown.values()]]).casefold()
+                    if needle not in haystack:
+                        continue
+                matching.append({**row, "translations": shown})
+            matching.sort(key=lambda r: (r["created_at"], r["number"] or 0))
+            total = len(matching)
+            kept = matching[-limit:] if limit and total > limit else matching
+            return {"chunks": kept, "total": total, "returned": len(kept), "truncated": total > len(kept),
+                    "retained": len(self.history), "max_retained": self._history_max, "server_time": now}
 
     def add_caption(self, message: dict[str, Any]) -> None:
         lang = str(message["lang"])
@@ -156,6 +211,13 @@ class DashboardState:
             if chunk:
                 chunk["targets"][lang] = {"status": "source" if lang == chunk["source_lang"] else "completed",
                                           "worker_id": message.get("worker_id")}
+            if chunk_id:
+                row = self._history_row(chunk_id, float(message.get("timestamp", time.time())))
+                row["translations"][lang] = {"text": str(message.get("text", "")),
+                                             "backend": message.get("translation_backend", "relay"),
+                                             "worker_id": message.get("worker_id"),
+                                             "timestamp": float(message.get("timestamp", time.time()))}
+                self._trim_history(time.time())
             self.captions[lang].appendleft({
                 "chunk_id": chunk_id,
                 "text": str(message.get("text", "")),
@@ -180,6 +242,7 @@ class DashboardState:
         with self._lock:
             for captions in self.captions.values():
                 captions.clear()
+            self.history.clear()
         self.event("Caption history cleared")
 
     def snapshot(self) -> dict[str, Any]:
@@ -666,7 +729,83 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError(f"Upload too large (max {max_bytes // (1024 * 1024)}MB)")
         return self.rfile.read(length)
 
+    @staticmethod
+    def _history_arguments(query_string: str) -> dict[str, Any]:
+        """Validate ?since&until&last_minutes&langs&q&limit; ValueError becomes a 400."""
+        params = urllib.parse.parse_qs(query_string)
+
+        def number(name: str) -> float | None:
+            raw = (params.get(name) or [""])[0].strip()
+            if not raw:
+                return None
+            try:
+                value = float(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be a number") from None
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ValueError(f"{name} must be a finite number")
+            return value
+
+        langs = [code for code in ((params.get("langs") or [""])[0].split(",")) if code]
+        for code in langs:
+            if code not in config.LANGUAGES:
+                raise ValueError(f"Unknown language {code!r}")
+        last_minutes = number("last_minutes")
+        if last_minutes is not None and last_minutes <= 0:
+            raise ValueError("last_minutes must be greater than 0")
+        query = (params.get("q") or [""])[0]
+        if len(query) > 200:
+            raise ValueError("Search text must be 200 characters or fewer")
+        limit = number("limit")
+        return {"since": number("since"), "until": number("until"), "last_minutes": last_minutes,
+                "langs": langs or None, "query": query or None,
+                "limit": 200 if limit is None else max(1, min(1000, int(limit)))}
+
+    def _history(self, query_string: str, export: bool) -> None:
+        try:
+            arguments = self._history_arguments(query_string)
+            params = urllib.parse.parse_qs(query_string)
+            if not export:
+                return self._json(self.runtime.state.query_history(**arguments))
+            kind = (params.get("format") or ["txt"])[0]
+            if kind not in caption_history.FORMATS:
+                raise ValueError("format must be txt, csv, json or srt")
+            arguments["limit"] = self.runtime.state._history_max
+            rows = self.runtime.state.query_history(**arguments)["chunks"]
+            langs = arguments["langs"] or list(config.TARGET_LANGUAGES)
+            if not rows:
+                return self._json({"error": "No captions in that time range"}, HTTPStatus.NOT_FOUND)
+            if kind == "srt":
+                lang = (params.get("lang") or [langs[0]])[0]
+                if lang not in config.LANGUAGES:
+                    raise ValueError(f"Unknown language {lang!r}")
+                body = caption_history.to_srt(rows, lang)
+                if not body:
+                    return self._json({"error": f"No {lang.upper()} captions in that time range"}, HTTPStatus.NOT_FOUND)
+            elif kind == "txt":
+                body = caption_history.to_txt(rows, langs)
+            elif kind == "csv":
+                body = "\ufeff" + caption_history.to_csv(rows, langs)   # BOM so Excel reads Burmese/Thai/Khmer
+            else:
+                body = caption_history.to_json(rows, langs)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        content_type, extension = caption_history.FORMATS[kind]
+        payload = body.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Disposition", f'attachment; filename="polyglot-captions-{time.strftime("%Y%m%d-%H%M%S")}.{extension}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/api/history":
+            return self._history(parsed.query, export=False)
+        if parsed.path == "/api/export":
+            return self._history(parsed.query, export=True)
         if self.path == "/api/status":
             return self._json(self.runtime.status())
         if self.path == "/api/captions":
