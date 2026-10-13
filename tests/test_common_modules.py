@@ -153,6 +153,59 @@ class ProtocolEdgeTests(unittest.TestCase):
             self.assertEqual(recv_one(a)["type"], "heartbeat")
             self.assertEqual(recv_one(a)["type"], "error")
 
+    def test_recv_one_reads_a_large_frame_quickly(self):
+        # the broker's job table reply is ~300 KB; reading it a byte at a time took ~1.6 s
+        big = {"type": "heartbeat_ack", "jobs": [{"chunk_id": f"ui-{n}", "lang": "th", "status": "completed"} for n in range(6000)]}
+        a, b = socket.socketpair()
+        with a, b:
+            sender = threading.Thread(target=lambda: b.sendall(encode(big) + encode({"type": "error"})), daemon=True)
+            sender.start()
+            started = time.monotonic()
+            message = recv_one(a)
+            elapsed = time.monotonic() - started
+            sender.join(2)
+            self.assertEqual(len(message["jobs"]), 6000)
+            self.assertLess(elapsed, 0.25)         # a byte at a time took ~0.9 s here
+            self.assertEqual(recv_one(a)["type"], "error")     # the next frame was left intact
+
+    def test_recv_one_handles_a_frame_arriving_in_pieces_without_losing_the_next_one(self):
+        a, b = socket.socketpair()
+        data = encode({"type": "transcript_chunk", "text": "x" * 70000}) + encode({"type": "heartbeat"})
+        with a, b:
+            def trickle():
+                for i in range(0, len(data), 9000):
+                    b.sendall(data[i:i + 9000])
+                    time.sleep(0.005)
+            sender = threading.Thread(target=trickle, daemon=True)
+            sender.start()
+            self.assertEqual(len(recv_one(a)["text"]), 70000)
+            self.assertEqual(recv_one(a)["type"], "heartbeat")
+            sender.join(2)
+
+    def test_recv_one_with_several_small_frames_already_buffered_takes_them_one_at_a_time(self):
+        a, b = socket.socketpair()
+        with a, b:
+            b.sendall(b"".join(encode({"type": "heartbeat", "n": n}) for n in range(50)))
+            self.assertEqual([recv_one(a)["n"] for _ in range(50)], list(range(50)))
+
+    def test_recv_one_frame_that_is_exactly_the_peek_size_still_ends_cleanly(self):
+        a, b = socket.socketpair()
+        with a, b:
+            frame = encode({"type": "heartbeat", "pad": ""})
+            pad = "p" * (65536 - len(frame))
+            data = encode({"type": "heartbeat", "pad": pad})
+            self.assertEqual(len(data), 65536)
+            b.sendall(data + encode({"type": "error"}))
+            self.assertEqual(len(recv_one(a)["pad"]), len(pad))
+            self.assertEqual(recv_one(a)["type"], "error")
+
+    def test_recv_one_an_empty_line_is_a_protocol_error(self):
+        a, b = socket.socketpair()
+        with a, b:
+            b.sendall(b"\n")
+            with self.assertRaises(ProtocolError):
+                recv_one(a)
+
     def test_recv_one_reports_closed_peer(self):
         a, b = socket.socketpair()
         b.close()

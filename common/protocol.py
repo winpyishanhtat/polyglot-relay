@@ -54,14 +54,23 @@ def decode_stream(sock: socket.socket) -> Iterator[dict[str, Any]]:
 
 def recv_one(sock: socket.socket) -> dict[str, Any]:
     """Receive one frame without consuming bytes from a following frame."""
+    # Peek, then consume exactly up to the end of this frame. Reading one byte at a time made a 300 KB
+    # reply (the broker's job table) take ~1.6s - 160x slower than one bulk read - and the dashboard
+    # asks for it every second. Peeking keeps the guarantee that bytes of a following frame stay unread.
     data = bytearray()
     while True:
-        byte = sock.recv(1)
-        if not byte:
+        peeked = sock.recv(65536, socket.MSG_PEEK)
+        if not peeked:
             raise ConnectionError("peer closed before sending a response")
-        if byte == b"\n":
+        newline = peeked.find(b"\n")
+        take = newline + 1 if newline >= 0 else len(peeked)
+        chunk = sock.recv(take)
+        if not chunk:
+            raise ConnectionError("peer closed before sending a response")
+        if chunk.endswith(b"\n"):
+            data.extend(chunk[:-1])
             break
-        data.extend(byte)
+        data.extend(chunk)
         if len(data) > 1_000_000:
             raise ProtocolError("JSON frame exceeds 1 MB")
     try:
