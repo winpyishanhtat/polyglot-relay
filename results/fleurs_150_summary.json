@@ -19,6 +19,25 @@
       "audio_seconds_total": 1415.4,
       "real_time_factor": 0.446
     },
+    "asr_all_gemini": {
+      "utterances": 150,
+      "cer_percent": 2.61,
+      "cer_ci95": [
+        1.95,
+        3.37
+      ],
+      "wer_percent": 4.62,
+      "wer_ci95": [
+        3.73,
+        5.61
+      ],
+      "empty_outputs": 0,
+      "errors": 0,
+      "unrecognised_windows": 0,
+      "median_seconds": 3.26,
+      "audio_seconds_total": 1415.4,
+      "real_time_factor": 0.363
+    },
     "mt_from_reference": null,
     "mt_end_to_end": null
   },
@@ -42,6 +61,7 @@
       "audio_seconds_total": 2385.2,
       "real_time_factor": 0.368
     },
+    "asr_all_gemini": null,
     "mt_from_reference": {
       "sentences": 150,
       "chrf_pp": 56.58,
@@ -82,6 +102,25 @@
       "median_seconds": 4.43,
       "audio_seconds_total": 1851.5,
       "real_time_factor": 0.552
+    },
+    "asr_all_gemini": {
+      "utterances": 150,
+      "cer_percent": 1.93,
+      "cer_ci95": [
+        1.37,
+        2.6
+      ],
+      "wer_percent": 3.99,
+      "wer_ci95": [
+        3.05,
+        5.01
+      ],
+      "empty_outputs": 0,
+      "errors": 0,
+      "unrecognised_windows": 0,
+      "median_seconds": 3.32,
+      "audio_seconds_total": 1851.5,
+      "real_time_factor": 0.322
     },
     "mt_from_reference": {
       "sentences": 150,
@@ -124,6 +163,25 @@
       "audio_seconds_total": 1686.1,
       "real_time_factor": 0.511
     },
+    "asr_all_gemini": {
+      "utterances": 150,
+      "cer_percent": 2.35,
+      "cer_ci95": [
+        1.81,
+        2.9
+      ],
+      "wer_percent": 5.62,
+      "wer_ci95": [
+        4.58,
+        6.68
+      ],
+      "empty_outputs": 0,
+      "errors": 0,
+      "unrecognised_windows": 0,
+      "median_seconds": 3.27,
+      "audio_seconds_total": 1686.1,
+      "real_time_factor": 0.325
+    },
     "mt_from_reference": {
       "sentences": 150,
       "chrf_pp": 68.87,
@@ -164,6 +222,25 @@
       "median_seconds": 7.83,
       "audio_seconds_total": 1722.7,
       "real_time_factor": 1.273
+    },
+    "asr_all_gemini": {
+      "utterances": 150,
+      "cer_percent": 7.77,
+      "cer_ci95": [
+        5.37,
+        10.9
+      ],
+      "wer_percent": 125.0,
+      "wer_ci95": [
+        99.44,
+        156.48
+      ],
+      "empty_outputs": 1,
+      "errors": 0,
+      "unrecognised_windows": 1,
+      "median_seconds": 3.43,
+      "audio_seconds_total": 1722.7,
+      "real_time_factor": 0.397
     },
     "mt_from_reference": {
       "sentences": 150,
@@ -206,6 +283,25 @@
       "audio_seconds_total": 1899.1,
       "real_time_factor": 0.84
     },
+    "asr_all_gemini": {
+      "utterances": 150,
+      "cer_percent": 4.4,
+      "cer_ci95": [
+        3.06,
+        6.22
+      ],
+      "wer_percent": 6.68,
+      "wer_ci95": [
+        5.13,
+        8.53
+      ],
+      "empty_outputs": 1,
+      "errors": 0,
+      "unrecognised_windows": 0,
+      "median_seconds": 3.52,
+      "audio_seconds_total": 1899.1,
+      "real_time_factor": 0.36
+    },
     "mt_from_reference": {
       "sentences": 150,
       "chrf_pp": 62.55,
@@ -246,6 +342,25 @@
       "median_seconds": 4.3,
       "audio_seconds_total": 2583.7,
       "real_time_factor": 0.304
+    },
+    "asr_all_gemini": {
+      "utterances": 150,
+      "cer_percent": 4.56,
+      "cer_ci95": [
+        3.84,
+        5.41
+      ],
+      "wer_percent": 10.9,
+      "wer_ci95": [
+        9.59,
+        12.32
+      ],
+      "empty_outputs": 0,
+      "errors": 0,
+      "unrecognised_windows": 0,
+      "median_seconds": 5.91,
+      "audio_seconds_total": 2583.7,
+      "real_time_factor": 0.328
     },
     "mt_from_reference": {
       "sentences": 150,
@@ -288,6 +403,7 @@
       "audio_seconds_total": 2257.0,
       "real_time_factor": 0.396
     },
+    "asr_all_gemini": null,
     "mt_from_reference": {
       "sentences": 150,
       "chrf_pp": 61.82,
@@ -329,6 +445,7 @@
       "audio_seconds_total": 2024.6,
       "real_time_factor": 0.422
     },
+    "asr_all_gemini": null,
     "mt_from_reference": {
       "sentences": 150,
       "chrf_pp": 61.76,
