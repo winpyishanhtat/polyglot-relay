@@ -4,13 +4,14 @@ manifest-driven speech and translation runner, and the failover trial tool."""
 import io
 import json
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
 import wave
 from unittest import mock
 
-from eval import failover_trials, fleurs_eval, metrics
+from eval import failover_trials, fleurs_eval, metrics, summarize_results
 
 REFS = ["The meeting starts now in the main hall.", "Welcome everyone, thank you.",
         "If you have questions, please raise your hand and ask.", "There will be a five minute break later."]
@@ -152,6 +153,30 @@ class ManifestTests(unittest.TestCase):
                                ([], "no usable")):
             with self.assertRaisesRegex(ValueError, fragment):
                 fleurs_eval.load_manifest(self.manifest(rows))
+
+    def test_wav_duration_of_the_32_bit_float_files_fleurs_ships(self):
+        import struct
+        rate, seconds = 16000, 2
+        data = b"\x00\x00\x00\x00" * rate * seconds
+        header = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" + b"fmt " + struct.pack("<IHHIIHH", 16, 3, 1, rate, rate * 4, 4, 32)
+                  + b"data" + struct.pack("<I", len(data)))
+        (self.dir / "float.wav").write_bytes(header + data)
+        self.assertAlmostEqual(fleurs_eval.wav_seconds(str(self.dir / "float.wav")), 2.0)
+
+    def test_wav_duration_skips_extra_chunks_and_tolerates_a_streamed_size(self):
+        import struct
+        data = b"\x01\x00" * 8000
+        body = (b"WAVE" + b"LIST" + struct.pack("<I", 5) + b"abcde\x00"      # odd-sized chunk is padded
+                + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
+                + b"data" + struct.pack("<I", 0xFFFFFFFF) + data)
+        (self.dir / "streamed.wav").write_bytes(b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + body)
+        self.assertAlmostEqual(fleurs_eval.wav_seconds(str(self.dir / "streamed.wav")), 0.5)
+
+    def test_wav_duration_of_garbage_and_truncated_headers_is_none(self):
+        (self.dir / "short.wav").write_bytes(b"RIFF\x00\x00")
+        (self.dir / "nofmt.wav").write_bytes(b"RIFF\x00\x00\x00WAVEdata\x00\x00\x00abcd")
+        for name in ("short.wav", "nofmt.wav"):
+            self.assertIsNone(fleurs_eval.wav_seconds(str(self.dir / name)), name)
 
     def test_wav_duration(self):
         write_wav(self.dir / "a.wav", 2.5)
@@ -295,6 +320,53 @@ class ReportTests(unittest.TestCase):
                 mock.patch("sys.stdout", new_callable=io.StringIO):
             fleurs_eval.main(["mt", "--manifest", str(manifest), "--out", str(mt_out), "--from-asr", str(out)])
         self.assertEqual(json.loads(mt_out.read_text(encoding="utf-8"))["summary"]["th"]["chrf_pp"], 100.0)
+
+
+class SummaryTableTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+
+    def write(self, name, lang, summary):
+        (self.dir / name).write_text(json.dumps({"summary": {lang: summary}}), encoding="utf-8")
+
+    def asr(self, lang, **extra):
+        base = {"utterances": 150, "cer_percent": 4.0, "cer_ci95": [3.0, 5.0], "wer_percent": 9.5, "wer_ci95": [8.0, 11.0],
+                "empty_outputs": 1, "median_seconds": 2.5, "real_time_factor": 0.2}
+        self.write(f"asr_{lang}.json", lang, {**base, **extra})
+
+    def test_languages_come_out_in_a_fixed_order_and_missing_ones_are_left_out(self):
+        self.asr("lo")
+        self.asr("en")
+        self.assertEqual([r["lang"] for r in summarize_results.build_rows(self.dir)], ["en", "lo"])
+
+    def test_a_row_combines_recognition_and_both_translation_scores(self):
+        self.asr("id")
+        self.write("mt_ref_id.json", "id", {"chrf_pp": 68.4, "chrf_pp_ci95": [66.3, 70.4]})
+        self.write("mt_e2e_id.json", "id", {"chrf_pp": 60.1, "chrf_pp_ci95": [58.0, 62.2]})
+        line = summarize_results.markdown(summarize_results.build_rows(self.dir)).splitlines()[2]
+        self.assertEqual(line, "| id | 150 | 4.0 (3.0-5.0) | 9.5 (8.0-11.0) | 1 | 2.5 | 0.2 | 68.4 (66.3-70.4) | 60.1 (58.0-62.2) |")
+
+    def test_word_error_rate_is_not_reported_for_scripts_without_word_spaces(self):
+        for lang in ("my", "th", "km", "lo"):
+            self.asr(lang)
+        for line in summarize_results.markdown(summarize_results.build_rows(self.dir)).splitlines()[2:]:
+            self.assertIn("| n/a |", line)
+
+    def test_missing_parts_show_as_dashes(self):
+        self.write("mt_ref_vi.json", "vi", {"chrf_pp": 62.0, "chrf_pp_ci95": [60.0, 64.0]})
+        line = summarize_results.markdown(summarize_results.build_rows(self.dir)).splitlines()[2]
+        self.assertEqual(line, "| vi | - | - | - | - | - | - | 62.0 (60.0-64.0) | - |")
+
+    def test_command_line_writes_the_table(self):
+        self.asr("en")
+        out = self.dir / "report.md"
+        with mock.patch("builtins.print"):
+            self.assertEqual(summarize_results.main(["--results", str(self.dir), "--out", str(out)]), 0)
+        self.assertIn("| en | 150 |", out.read_text(encoding="utf-8"))
+
+    def test_an_empty_directory_gives_just_the_header(self):
+        self.assertEqual(len(summarize_results.markdown(summarize_results.build_rows(self.dir)).splitlines()), 2)
 
 
 class FailoverToolTests(unittest.TestCase):

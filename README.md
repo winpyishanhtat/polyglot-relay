@@ -133,10 +133,18 @@ This is still one shared room per dashboard: everyone sees the same captions.
 shape for Burmese, Khmer, Lao and the other languages here), then:
 
 ```bash
+# download the first 150 test clips per language from FLEURS (CC-BY-4.0) and write the manifest
+python -m eval.prepare_fleurs --out data/fleurs --clips 150
 python -m eval.fleurs_eval asr --manifest data/manifest.jsonl --out results/asr.json
 python -m eval.fleurs_eval mt  --manifest data/manifest.jsonl --out results/mt.json --from-asr results/asr.json
 python -m eval.failover_trials --trials 30 --out results/failover.json
 ```
+
+`prepare_fleurs` streams only the start of each language's test archive (about 100 MB per language, not
+the 250-650 MB archive), so each language is scored on its own clips. Run the evaluation inside the `full`
+image (it has Whisper and ffmpeg) and only two Whisper containers at a time: five exceed Docker Desktop's
+default 3.5 GB. `python -m eval.summarize_results --results results/` merges the per-language files
+into one table.
 
 `asr` reports character and word error rate, empty outputs, seconds per clip and real-time factor;
 `mt` reports chrF++ against the human English translation. Both give 95% bootstrap intervals, and

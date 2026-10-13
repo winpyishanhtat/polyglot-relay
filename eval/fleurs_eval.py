@@ -32,7 +32,6 @@ import json
 import pathlib
 import statistics
 import time
-import wave
 from collections.abc import Callable, Iterable
 
 from eval import metrics
@@ -73,10 +72,31 @@ def load_manifest(path: pathlib.Path, languages: Iterable[str] | None = None,
 
 
 def wav_seconds(path: str) -> float | None:
+    """Duration of a RIFF/WAVE file from its header: works for integer PCM, 32-bit float
+    (FLEURS) and WAVE_FORMAT_EXTENSIBLE, which Python's wave module cannot read."""
     try:
-        with wave.open(path) as w:
-            return w.getnframes() / w.getframerate()
-    except (wave.Error, EOFError, FileNotFoundError):
+        with open(path, "rb") as f:
+            header = f.read(12)
+            if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+                return None
+            byte_rate = None
+            while True:
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    return None
+                name, size = chunk[:4], int.from_bytes(chunk[4:], "little")
+                if name == b"fmt ":
+                    fmt = f.read(size + (size & 1))
+                    byte_rate = int.from_bytes(fmt[8:12], "little") if len(fmt) >= 12 else None
+                elif name == b"data":
+                    if not byte_rate:
+                        return None
+                    if size in (0, 0xFFFFFFFF):          # streamed file: size unknown, use what is there
+                        size = max(0, pathlib.Path(path).stat().st_size - f.tell())
+                    return size / byte_rate
+                else:
+                    f.seek(size + (size & 1), 1)
+    except OSError:
         return None
 
 
