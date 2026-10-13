@@ -89,6 +89,7 @@ Full Docker walkthrough — including a pure-Gemini overlay, worker-failure and 
 ├── translator_worker.py       # Registers with leader; translates; serves listeners
 ├── listener_client.py         # Terminal client: connects to an assigned worker, displays captions
 ├── web_ui.py + ui/            # Web dashboard — the primary way to run this
+├── history.py                  # Caption history exports (text, CSV, JSON, SRT)
 ├── gemini_rate_gate.py         # Shared rate limiter for Gemini's free tier
 ├── common/                     # Protocol, election, heartbeat, discovery, config
 ├── eval/                       # Metrics (CER/WER/chrF++ with bootstrap CIs), FLEURS-style runner, failover trials
@@ -125,6 +126,17 @@ The defaults suit one person on one machine. Before others can reach it:
    your tier. Captions are held in memory only and are not written to disk.
 
 This is still one shared room per dashboard: everyone sees the same captions.
+
+## History
+
+The live caption cards show the latest 50 captions per language and keep their scroll position. The
+**History** panel keeps everything said and translated (up to `POLYGLOT_HISTORY_CHUNKS`, default 2000
+chunks, optionally limited by age with `POLYGLOT_HISTORY_MINUTES`). Choose a time frame (last 5, 15 or 60
+minutes, the whole session, or a custom from/to), the languages to read, and a search term, then export what
+you see as text, CSV (opens in Excel with Burmese, Thai and Khmer intact), JSON or SRT subtitles. The same
+data is available at `/api/history` and `/api/export` (`since`, `until`, `last_minutes`, `langs`, `q`,
+`limit`, `format`, `lang`). History is held in memory only: a restart or **Clear captions & history**
+empties it, so export anything you need to keep.
 
 ## Evaluating it
 
@@ -172,6 +184,7 @@ Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built
 | Translator worker: retry rules, Gemini text/Live calls, LibreTranslate, English pivot, worker process | `test_languages.py`, `test_gemini_translation.py`, `test_worker_runtime.py` |
 | Speech-to-text: Whisper windows and filters, Gemini transcription, producer, CLI | `test_stt_service.py`, `test_stt_runtime.py`, `test_chunk_pipeline.py` |
 | Dashboard server: state, validation, listeners, broker status, HTTP routes, uploads, live slices | `test_web_ui.py`, `test_web_ui_extra.py` |
+| Caption history: store, time/language/text filters, exports, routes | `test_history.py` |
 | Dashboard page and live slicer (JavaScript) | `test_ui_app.py` + `tests/js/`, `test_live_slicer.py` |
 | Rate gate, evaluation metrics, evaluation runner, failover trials | `test_gemini_rate_gate.py`, `test_gate_and_eval.py`, `test_evaluation.py`, `test_eval_harness.py` |
 
