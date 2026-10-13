@@ -152,7 +152,9 @@ python -m eval.fleurs_eval mt  --manifest data/manifest.jsonl --out results/mt.j
 python -m eval.failover_trials --trials 30 --out results/failover.json
 ```
 
-`prepare_fleurs` streams only the start of each language's test archive (about 100 MB per language, not
+`--stt default|gemini|whisper` chooses the recogniser: `default` is what the relay does (Gemini first for every
+language, Whisper as the fallback where it can read the language), `gemini` is Gemini only, `whisper` is
+Whisper wherever it can read the language. `prepare_fleurs` streams only the start of each language's test archive (about 100 MB per language, not
 the 250-650 MB archive), so each language is scored on its own clips. Run the evaluation inside the `full`
 image (it has Whisper and ffmpeg) and only two Whisper containers at a time: five exceed Docker Desktop's
 default 3.5 GB. `python -m eval.summarize_results --results results/` merges the per-language files
