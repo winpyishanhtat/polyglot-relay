@@ -479,6 +479,25 @@ class WindowGuardTests(unittest.TestCase):
         out, calls, _ = self.run_clip(self.tone(2.0, level=0.01))
         self.assertEqual(len(calls), 1)
 
+    def test_very_quiet_real_speech_is_sent(self):
+        # FLEURS recordings reach peaks of only ~0.002 (RMS ~0.0004); seven of them were once dropped as silence
+        out, calls, gaps = self.run_clip(self.tone(3.0, level=0.002))
+        self.assertEqual((len(calls), len(out), gaps), (1, 1, []))
+
+    def test_a_signal_below_the_floor_counts_as_silence(self):
+        out, calls, gaps = self.run_clip(self.tone(3.0, level=0.0005))
+        self.assertEqual((out, calls, gaps), ([], [], []))
+
+    def test_the_silence_floor_is_configurable(self):
+        out, calls, _ = self.run_clip(self.tone(3.0, level=0.002), POLYGLOT_SILENCE_PEAK="0.01")
+        self.assertEqual(calls, [])
+        out, calls, _ = self.run_clip(self.tone(3.0, level=0.0005), POLYGLOT_SILENCE_PEAK="0.0001")
+        self.assertEqual(len(calls), 1)
+
+    def test_an_empty_setting_uses_the_default_floor(self):
+        out, calls, _ = self.run_clip(self.tone(3.0, level=0.002), POLYGLOT_SILENCE_PEAK="")
+        self.assertEqual(len(calls), 1)
+
     def test_unmeasurable_audio_is_sent_rather_than_dropped(self):
         self.assertFalse(stt_service._window_is_unusable(object(), 16000))
         self.assertFalse(stt_service._window_is_unusable(list(range(100)), 1))

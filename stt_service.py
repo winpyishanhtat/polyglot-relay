@@ -151,7 +151,10 @@ def _pcm_window_to_wav_bytes(window: Any, sample_rate: int) -> bytes:
 # sending: asking a speech model to transcribe a sliver of audio is how
 # invented words get into a caption.
 _MIN_WINDOW_SECONDS = 0.7
-_SILENCE_PEAK = 0.003
+# Peak level (0-1) below which a window is treated as no signal at all. Real, quiet read-aloud
+# speech in FLEURS reaches peaks of about 0.002, so this sits well under that: an earlier value of
+# 0.003 silently dropped 7 of 1,350 real recordings. Digital silence and a muted microphone are ~0.
+_SILENCE_PEAK = 0.001
 
 
 def _window_is_unusable(window: Any, sample_rate: int) -> bool:
@@ -161,7 +164,8 @@ def _window_is_unusable(window: Any, sample_rate: int) -> bool:
         minimum = float(os.getenv("POLYGLOT_MIN_WINDOW_SECONDS") or _MIN_WINDOW_SECONDS)
         if len(window) < minimum * sample_rate:
             return True
-        return float(abs(window).max()) < _SILENCE_PEAK
+        floor = float(os.getenv("POLYGLOT_SILENCE_PEAK") or _SILENCE_PEAK)
+        return float(abs(window).max()) < floor
     except Exception:
         return False
 
