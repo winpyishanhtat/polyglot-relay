@@ -1,5 +1,7 @@
 import os
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 from unittest import mock
 
 from common import config

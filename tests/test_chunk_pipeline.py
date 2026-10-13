@@ -1,5 +1,7 @@
 import pathlib
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 from unittest import mock
 
 from broker import Broker, WorkerConnection

@@ -1,6 +1,8 @@
 import inspect
 import unittest
 
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
+
 try:
     from google.genai import types
     from google.genai.live import AsyncSession

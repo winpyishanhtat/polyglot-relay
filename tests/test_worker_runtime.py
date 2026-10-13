@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 from unittest import mock
 
 import translator_worker

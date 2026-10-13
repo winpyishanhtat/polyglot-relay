@@ -8,6 +8,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 import wave
 from unittest import mock
 

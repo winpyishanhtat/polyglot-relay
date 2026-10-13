@@ -2,6 +2,8 @@ import json
 import threading
 import time
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -424,8 +426,13 @@ class LiveParallelOrderingTests(unittest.TestCase):
     def test_gemini_only_languages_transcribe_in_parallel(self):
         self.assertGreaterEqual(self._max_concurrency("my"), 2)
 
-    def test_whisper_languages_stay_serialized(self):
-        self.assertEqual(self._max_concurrency("th"), 1)
+    def test_languages_known_to_gemini_transcribe_in_parallel_by_default(self):
+        for language in ("vi", "th", "en"):
+            self.assertGreaterEqual(self._max_concurrency(language), 2, language)
+
+    def test_whisper_languages_stay_serialized_when_gemini_is_switched_off_for_them(self):
+        with mock.patch.dict("os.environ", {"POLYGLOT_GEMINI_STT_LANGUAGES": "none"}):
+            self.assertEqual(self._max_concurrency("th"), 1)
 
     def test_a_stuck_slice_is_skipped_so_later_captions_still_flow(self):
         release = threading.Event()

@@ -1,5 +1,7 @@
 import pathlib
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 from unittest import mock
 
 from stt_service import (
@@ -132,8 +134,9 @@ class GapInsteadOfWhisperTests(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertEqual(len(gaps), 3)
 
-    def test_languages_whisper_can_do_are_unaffected(self):
-        out, gaps, model, gemini = self._run("th", [])
+    def test_languages_whisper_can_do_use_whisper_when_gemini_is_switched_off_for_them(self):
+        with mock.patch.dict("os.environ", {"POLYGLOT_GEMINI_STT_LANGUAGES": "none"}):
+            out, gaps, model, gemini = self._run("th", [])
         self.assertEqual([c[0] for c in out], ["nonsense"] * 3)  # Whisper's text, by design, for th
         self.assertEqual(gaps, [])
         gemini.assert_not_called()

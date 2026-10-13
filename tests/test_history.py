@@ -7,6 +7,8 @@ import json
 import threading
 import time
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 import urllib.error
 import urllib.parse
 import urllib.request

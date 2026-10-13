@@ -2,6 +2,8 @@ import base64
 import json
 import unittest
 
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
+
 from stt_service import TranscriptProducer
 from translator_worker import Translator
 

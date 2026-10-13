@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer

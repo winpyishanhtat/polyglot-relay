@@ -9,6 +9,8 @@ import threading
 import time
 import types
 import unittest
+
+import hermetic  # noqa: F401  (drops real API keys so no test reaches the network)
 import wave
 from unittest import mock
 
@@ -505,7 +507,7 @@ class WindowGuardTests(unittest.TestCase):
     def test_languages_whisper_can_read_are_not_filtered_by_this_guard(self):
         fake = FakeWhisper([{"language": "en", "segments": [seg("hello")]}], seconds=1)
         fake.load_audio = lambda path: np.zeros(16000, dtype=np.float32)
-        with mock.patch.dict(sys.modules, {"whisper": fake}):
+        with mock.patch.dict(sys.modules, {"whisper": fake}), mock.patch.dict("os.environ", {"POLYGLOT_GEMINI_STT_LANGUAGES": "none"}):
             out = list(stt_service.transcribe_file("x.wav", "base", "en"))
         self.assertEqual(out[0][0], "hello")
 
