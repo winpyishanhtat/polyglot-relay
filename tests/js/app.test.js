@@ -77,6 +77,9 @@ function load({ fetchImpl, search, stored } = {}) {
     fetch: fetchImpl || (async (url, options) => {
       calls.push([url, options]);
       if (url === "/api/languages") return { ok: true, json: async () => ({ languages: LANGUAGES }) };
+      if (String(url).startsWith("/api/history")) {
+        return { ok: true, json: async () => ({ chunks: [], total: 0, returned: 0, truncated: false, retained: 0, max_retained: 2000, server_time: 0 }) };
+      }
       return { ok: true, json: async () => ({}) };
     }),
     setInterval: () => 0,
@@ -90,6 +93,8 @@ function load({ fetchImpl, search, stored } = {}) {
     performance: { now: () => 0 },
     Intl, Date, JSON, Math, Object, Array, String, Number, Boolean, Promise, Set, Map, Error, console, URLSearchParams,
     Blob: class {},
+    confirm: () => true,
+    URL: { createObjectURL: () => "blob:default", revokeObjectURL() {} },
   };
   sandbox.window = sandbox;
   if (search !== undefined) sandbox.location = { search };
@@ -178,16 +183,16 @@ test("post falls back to a generic message when the error has no text", async ()
   await assert.rejects(page.sandbox.post("/x"), /Request failed/);
 });
 
-test("captions render oldest-first by chunk number, newest twelve only", async () => {
-  const { sandbox, registry, get } = await booted();
-  const card = get('.caption-card[data-lang="th"]');
+test("a live card shows every caption the server keeps, oldest first", async () => {
+  const { sandbox, get } = await booted();
+  get('.caption-card[data-lang="th"]');
   const feed = get("#captions-th");
-  const items = Array.from({ length: 15 }, (_, i) => caption({ number: 15 - i, text: `line ${15 - i}`, chunk_id: `c${i}` }));
+  const items = Array.from({ length: 50 }, (_, i) => caption({ number: 50 - i, text: `line ${50 - i}`, chunk_id: `c${i}` }));
   sandbox.renderCaptions({ th: items }, { th: { connected: true } });
-  assert.equal(feed.children.length, 12);
-  assert.match(feed.children[0].allText(), /line 4\b/);
-  assert.match(feed.children[11].allText(), /line 15\b/);
-  assert.ok(card.classList.contains("connected"));
+  assert.equal(feed.children.length, 50);
+  assert.match(feed.children[0].allText(), /line 1\b/);
+  assert.match(feed.children[49].allText(), /line 50\b/);
+  assert.ok(get('.caption-card[data-lang="th"]').classList.contains("connected"));
 });
 
 test("a language with no captions shows its waiting message, Burmese in Burmese", async () => {
@@ -401,4 +406,341 @@ test("a server that demands a token reports it clearly instead of failing silent
   const page = load({ fetchImpl });
   await settle();
   await assert.rejects(page.sandbox.post("/api/captions", { text: "x" }), /Access token required/);
+});
+
+
+// ---- history -------------------------------------------------------------------------
+
+function historyPayload(chunks, extra = {}) {
+  return { chunks, total: chunks.length, returned: chunks.length, truncated: false, retained: chunks.length,
+           max_retained: 2000, server_time: 1700000100, ...extra };
+}
+
+function chunkRow(overrides = {}) {
+  return { chunk_id: "c1", number: 1, created_at: 1700000000, text: "Good morning", source_lang: "en",
+           translations: { th: { text: "sawasdee", backend: "gemini-text" } }, ...overrides };
+}
+
+function historyFetch(calls, payload) {
+  return async (url, options) => {
+    calls.push([url, options || {}]);
+    if (url === "/api/languages") return { ok: true, status: 200, json: async () => ({ languages: LANGUAGES }) };
+    if (url.startsWith("/api/history")) return { ok: true, status: 200, json: async () => payload };
+    if (url.startsWith("/api/export")) {
+      return { ok: true, status: 200, blob: async () => ({}), headers: { get: () => 'attachment; filename="polyglot-captions-1.txt"' } };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+}
+
+async function historyPage(payload = historyPayload([]), options = {}) {
+  const calls = [];
+  const page = load({ fetchImpl: historyFetch(calls, payload), ...options });
+  page.sandbox.URL = { createObjectURL: () => "blob:test", revokeObjectURL() {} };
+  await settle();
+  return { page, calls, run: page.run, get: page.get };
+}
+
+test("the history asks for the last 15 minutes in English by default", async () => {
+  const { calls } = await historyPage();
+  const url = calls.find(([u]) => u.startsWith("/api/history"))[0];
+  const params = new URLSearchParams(url.split("?")[1]);
+  assert.equal(params.get("last_minutes"), "15");
+  assert.equal(params.get("langs"), "en");
+  assert.equal(params.get("limit"), "500");
+  assert.equal(params.get("q"), null);
+});
+
+test("the time frame choices become the right request", async () => {
+  const { page, run } = await historyPage();
+  const params = (range) => { run(`historyView.range = ${JSON.stringify(range)}`); return page.sandbox.historyParams(); };
+  assert.equal(params("5").get("last_minutes"), "5");
+  assert.equal(params("60").get("last_minutes"), "60");
+  const whole = params("all");
+  assert.equal(whole.get("last_minutes"), null);
+  assert.equal(whole.get("since"), null);
+});
+
+test("a custom range sends the chosen start and end as unix times", async () => {
+  const { page, run, get } = await historyPage();
+  get("#history-from").value = "2026-10-13T10:00:00";
+  get("#history-to").value = "2026-10-13T10:30:00";
+  run('historyView.range = "custom"');
+  const params = page.sandbox.historyParams();
+  assert.equal(Number(params.get("until")) - Number(params.get("since")), 1800);
+  assert.equal(params.get("last_minutes"), null);
+});
+
+test("a custom range with only a start is open ended", async () => {
+  const { page, run, get } = await historyPage();
+  get("#history-from").value = "2026-10-13T10:00:00";
+  get("#history-to").value = "";
+  run('historyView.range = "custom"');
+  const params = page.sandbox.historyParams();
+  assert.ok(params.get("since"));
+  assert.equal(params.get("until"), null);
+});
+
+test("languages are requested in the page's order and the search text is passed on", async () => {
+  const { page, run } = await historyPage();
+  run('historyView.langs = new Set(["lo", "th", "en"]); historyView.query = "break time"');
+  const params = page.sandbox.historyParams();
+  assert.equal(params.get("langs"), "en,th,lo");
+  assert.equal(params.get("q"), "break time");
+});
+
+test("choosing no languages asks for the original text only", async () => {
+  const { page, run } = await historyPage();
+  run("historyView.langs = new Set()");
+  assert.equal(page.sandbox.historyParams().get("langs"), "");
+});
+
+test("each chunk shows when it was said, the language spoken, the original and the chosen translations", async () => {
+  const { page, get, run } = await historyPage();
+  run('historyView.langs = new Set(["th"])');
+  page.sandbox.renderHistory(historyPayload([chunkRow({ number: 7, source_lang: "my", text: "original text" })]));
+  const row = get("#history-list").children[0];
+  const text = row.allText();
+  assert.match(text, /#7/);
+  assert.match(text, /MY-name/);
+  assert.match(text, /original text/);
+  assert.match(text, /TH/);
+  assert.match(text, /sawasdee/);
+  assert.match(text, /gemini-text/);
+  assert.match(row.children[0].allText(), /\d{1,2}:\d{2}:\d{2}/);
+});
+
+test("languages that are not chosen are not shown", async () => {
+  const { page, get } = await historyPage();
+  page.sandbox.renderHistory(historyPayload([chunkRow({ translations: { th: { text: "sawasdee" }, km: { text: "khmer text" } } })]));
+  const text = get("#history-list").children[0].allText();
+  assert.doesNotMatch(text, /sawasdee/);       // only English is chosen by default
+  assert.doesNotMatch(text, /khmer text/);
+});
+
+test("the spoken language's own copy is not repeated under the original", async () => {
+  const { page, run, get } = await historyPage();
+  run('historyView.langs = new Set(["en", "th"])');
+  page.sandbox.renderHistory(historyPayload([chunkRow({ translations: {
+    en: { text: "Good morning", backend: "passthrough" }, th: { text: "sawasdee", backend: "gemini-text" } } })]));
+  const lines = get("#history-list").children[0].children.filter((c) => c.className === "history-line");
+  assert.equal(lines.length, 1);
+  assert.match(lines[0].allText(), /sawasdee/);
+});
+
+test("a language still being translated says so, and later says there is none", async () => {
+  const { page, run, get } = await historyPage();
+  run('historyView.langs = new Set(["th"])');
+  page.sandbox.renderHistory(historyPayload([chunkRow({ created_at: 1700000090, translations: {} })]));   // 10 s old
+  assert.match(get("#history-list").children[0].allText(), /translating/);
+  page.sandbox.renderHistory(historyPayload([chunkRow({ created_at: 1699990000, translations: {} })]));   // long ago
+  assert.match(get("#history-list").children[0].allText(), /no translation/);
+});
+
+test("a chunk whose original was never recorded is labelled rather than blank", async () => {
+  const { page, get } = await historyPage();
+  page.sandbox.renderHistory(historyPayload([chunkRow({ text: null, number: null, source_lang: null })]));
+  const text = get("#history-list").children[0].allText();
+  assert.match(text, /original not recorded/);
+  assert.match(text, /auto-detected/);
+});
+
+test("the count line says how much is shown, whether the newest were cut, and what is kept", async () => {
+  const { page, get } = await historyPage();
+  page.sandbox.renderHistory(historyPayload([chunkRow()], { total: 1, returned: 1, retained: 40, max_retained: 2000 }));
+  assert.equal(get("#history-count").textContent, "1 of 1 chunk · 40 kept (up to 2000)");
+  page.sandbox.renderHistory(historyPayload([chunkRow(), chunkRow({ chunk_id: "c2" })], { total: 900, returned: 2, truncated: true }));
+  assert.match(get("#history-count").textContent, /2 of 900 chunks · newest 2 shown/);
+});
+
+test("empty history gives different advice for no speech yet and no match", async () => {
+  const { page, get } = await historyPage();
+  page.sandbox.renderHistory(historyPayload([], { retained: 0, total: 0 }));
+  assert.match(get("#history-list").children[0].textContent, /Nothing spoken yet/);
+  page.sandbox.renderHistory(historyPayload([], { retained: 25, total: 0 }));
+  assert.match(get("#history-list").children[0].textContent, /Nothing matches this time frame/);
+});
+
+test("history text is inserted as text, never as markup", async () => {
+  const { page, get } = await historyPage();
+  // FakeElement throws if innerHTML is ever assigned.
+  page.sandbox.renderHistory(historyPayload([chunkRow({ text: "<img src=x onerror=alert(1)>",
+    translations: { th: { text: "<b>bold</b>", backend: "<script>" } } })]));
+  assert.match(get("#history-list").children[0].allText(), /<img src=x onerror=alert\(1\)>/);
+});
+
+test("with follow on, the list stays at the newest; scrolled up, it is left where it was", async () => {
+  const { page, get } = await historyPage();
+  const list = get("#history-list");
+  list.scrollHeight = 5000; list.clientHeight = 500; list.scrollTop = 4500;     // at the bottom
+  page.sandbox.renderHistory(historyPayload([chunkRow()]));
+  assert.equal(list.scrollTop, 5000);
+  list.scrollHeight = 5000; list.scrollTop = 1200;                              // reading older entries
+  page.sandbox.renderHistory(historyPayload([chunkRow()]));
+  assert.equal(list.scrollTop, 1200);
+});
+
+test("with follow switched off the list never jumps to the bottom", async () => {
+  const { page, run, get } = await historyPage();
+  const list = get("#history-list");
+  run("historyView.follow = false");
+  list.scrollHeight = 5000; list.clientHeight = 500; list.scrollTop = 4500;
+  page.sandbox.renderHistory(historyPayload([chunkRow()]));
+  assert.equal(list.scrollTop, 4500);
+});
+
+test("changing the time frame reloads, and a custom range reveals its date fields", async () => {
+  const { calls, get } = await historyPage();
+  const before = calls.filter(([u]) => u.startsWith("/api/history")).length;
+  const range = get("#history-range");
+  range.value = "custom";
+  for (const handler of range.listeners.change) handler({});
+  await settle();
+  assert.equal(get("#history-custom").hidden, false);
+  assert.ok(get("#history-from").value && get("#history-to").value);       // prefilled with the last 15 minutes
+  assert.ok(calls.filter(([u]) => u.startsWith("/api/history")).length > before);
+  range.value = "60";
+  for (const handler of range.listeners.change) handler({});
+  assert.equal(get("#history-custom").hidden, true);
+});
+
+test("the time frame menu offers recent windows, the whole session and a custom range", async () => {
+  const { get } = await historyPage();
+  assert.deepEqual(get("#history-range").children.map((o) => o.value), ["5", "15", "60", "all", "custom"]);
+});
+
+test("toggling a language chip changes what is requested", async () => {
+  const { calls, get, run } = await historyPage();
+  const chips = get("#history-langs").children;
+  assert.equal(chips.length, 9);
+  const thai = chips.find((c) => c.dataset.lang === "th");
+  await thai.click();
+  await settle();
+  assert.equal(run("Array.from(historyView.langs).sort().join()"), "en,th");
+  assert.equal(thai.attributes["aria-pressed"], "true");
+  const last = calls.filter(([u]) => u.startsWith("/api/history")).at(-1)[0];
+  assert.equal(new URLSearchParams(last.split("?")[1]).get("langs"), "en,th");
+  await thai.click();
+  assert.equal(run("historyView.langs.has('th')"), false);
+});
+
+test("All selects every language and Original only selects none", async () => {
+  const { get, run } = await historyPage();
+  await get("#history-all").click();
+  assert.equal(run("historyView.langs.size"), 9);
+  await get("#history-none").click();
+  assert.equal(run("historyView.langs.size"), 0);
+  assert.ok(get("#history-langs").children.every((c) => c.attributes["aria-pressed"] === "false"));
+});
+
+test("typing in the search box sets the query after a short pause", async () => {
+  const { get, run, page } = await historyPage();
+  const timers = [];
+  page.sandbox.setTimeout = (fn, ms) => { timers.push([fn, ms]); return timers.length; };
+  const search = get("#history-search");
+  for (const handler of search.listeners.input) handler({ target: { value: "  coffee break " } });
+  assert.equal(run("historyView.query"), "coffee break");
+  assert.equal(timers.at(-1)[1], 250);
+});
+
+test("the follow checkbox controls live updating", async () => {
+  const { get, run } = await historyPage();
+  for (const handler of get("#history-follow").listeners.change) handler({ target: { checked: false } });
+  assert.equal(run("historyView.follow"), false);
+});
+
+test("export asks the server for the chosen format over the same range and downloads the file", async () => {
+  const { page, calls } = await historyPage();
+  const clicked = [];
+  const originalCreate = page.sandbox.document.createElement;
+  page.sandbox.document.createElement = (tag) => {
+    const element = originalCreate(tag);
+    if (tag === "a") element.click = () => clicked.push(element);
+    return element;
+  };
+  await page.sandbox.exportHistory("csv");
+  const url = calls.find(([u]) => u.startsWith("/api/export"))[0];
+  const params = new URLSearchParams(url.split("?")[1]);
+  assert.equal(params.get("format"), "csv");
+  assert.equal(params.get("last_minutes"), "15");
+  assert.equal(params.get("langs"), "en");
+  assert.equal(clicked.length, 1);
+  assert.equal(clicked[0].download, "polyglot-captions-1.txt");
+  assert.equal(clicked[0].href, "blob:test");
+});
+
+test("subtitle export names the first chosen language", async () => {
+  const { page, calls, run } = await historyPage();
+  run('historyView.langs = new Set(["lo", "km"])');
+  await page.sandbox.exportHistory("srt");
+  const params = new URLSearchParams(calls.find(([u]) => u.startsWith("/api/export"))[0].split("?")[1]);
+  assert.equal(params.get("lang"), "km");
+});
+
+test("subtitles need a language", async () => {
+  const { page, calls, run, get } = await historyPage();
+  run("historyView.langs = new Set()");
+  await page.sandbox.exportHistory("srt");
+  assert.equal(calls.filter(([u]) => u.startsWith("/api/export")).length, 0);
+  assert.match(get("#toast").textContent, /Choose a language/);
+});
+
+test("an export the server refuses is explained, not downloaded", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push([url, options || {}]);
+    if (url === "/api/languages") return { ok: true, status: 200, json: async () => ({ languages: LANGUAGES }) };
+    if (url.startsWith("/api/export")) return { ok: false, status: 404, json: async () => ({ error: "No captions in that time range" }) };
+    return { ok: true, status: 200, json: async () => historyPayload([]) };
+  };
+  const page = load({ fetchImpl });
+  await settle();
+  await page.sandbox.exportHistory("txt");
+  assert.match(page.get("#toast").textContent, /No captions in that time range/);
+});
+
+test("if the history cannot be loaded the count line says why", async () => {
+  const fetchImpl = async (url) => url === "/api/languages"
+    ? { ok: true, status: 200, json: async () => ({ languages: LANGUAGES }) }
+    : { ok: false, status: 400, json: async () => ({ error: "since must be a number" }) };
+  const page = load({ fetchImpl });
+  await settle();
+  assert.equal(page.get("#history-count").textContent, "since must be a number");
+});
+
+test("clearing asks first, and does nothing if you decline", async () => {
+  const calls = [];
+  const page = load({ fetchImpl: historyFetch(calls, historyPayload([])) });
+  page.sandbox.confirm = () => false;
+  await settle();
+  await page.get("#clear-button").click();
+  assert.equal(calls.filter(([u]) => u === "/api/clear").length, 0);
+  page.sandbox.confirm = () => true;
+  await page.get("#clear-button").click();
+  assert.equal(calls.filter(([u]) => u === "/api/clear").length, 1);
+});
+
+// ---- live caption cards ----------------------------------------------------------------
+
+test("a live card follows the newest caption unless the reader has scrolled up", async () => {
+  const { sandbox, get } = await booted();
+  get('.caption-card[data-lang="th"]');
+  const feed = get("#captions-th");
+  feed.scrollHeight = 3000; feed.scrollTop = 0;
+  sandbox.renderCaptions({ th: [caption({ number: 1, text: "a" })] }, {});
+  assert.equal(feed.scrollTop, 3000);                           // following by default
+  feed.dataset.pinned = "1"; feed.scrollTop = 700;              // reader scrolled up
+  sandbox.renderCaptions({ th: [caption({ number: 1, text: "a" }), caption({ number: 2, text: "b" })] }, {});
+  assert.equal(feed.scrollTop, 700);
+});
+
+test("scrolling a live card up pins it and scrolling back down releases it", async () => {
+  const { get } = await booted();
+  const feed = get("#caption-grid").children.find((card) => card.dataset.lang === "th").children[1];
+  feed.scrollHeight = 3000; feed.clientHeight = 232; feed.scrollTop = 500;
+  for (const handler of feed.listeners.scroll || []) handler({});
+  assert.equal(feed.dataset.pinned, "1");
+  feed.scrollTop = 2760;
+  for (const handler of feed.listeners.scroll || []) handler({});
+  assert.equal(feed.dataset.pinned, "");
 });
