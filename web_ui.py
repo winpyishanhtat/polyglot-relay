@@ -25,8 +25,7 @@ import history as caption_history
 from common import config
 from common.discovery import discover_worker
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
-from stt_service import _GEMINI_STT_LANGUAGES as GEMINI_STT_LANGUAGES
-from stt_service import DEMO_SENTENCES, TranscriptProducer, _load_whisper, transcribe_file
+from stt_service import DEMO_SENTENCES, TranscriptProducer, _load_whisper, gemini_first, transcribe_file
 from translator_worker import _LIBRETRANSLATE_NEVER_SUPPORTS as PIVOT_SOURCES
 from translator_worker import Translator
 
@@ -331,7 +330,7 @@ class DashboardRuntime:
         # accurate than guessing, especially for languages Whisper is
         # weaker at recognizing unprompted.
         language_hint = source_lang if source_lang and source_lang != "auto" else None
-        guard = contextlib.nullcontext() if language_hint in GEMINI_STT_LANGUAGES else self._whisper_lock
+        guard = contextlib.nullcontext() if gemini_first(language_hint) else self._whisper_lock
         with tempfile.NamedTemporaryFile(suffix=".media", delete=False) as tmp:
             tmp.write(data)
             tmp_path = pathlib.Path(tmp.name)

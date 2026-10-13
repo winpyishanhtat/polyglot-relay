@@ -132,6 +132,30 @@ def _pcm16(audio: Any) -> bytes:
 _GEMINI_STT_LANGUAGES = frozenset({"my", "km", "lo"})
 
 
+def gemini_first(language: str | None) -> bool:
+    """Should this (known) spoken language be transcribed by Gemini rather than Whisper?
+
+    Always for Burmese, Khmer and Lao. For the rest it is POLYGLOT_GEMINI_STT_LANGUAGES: "all" (the
+    default; an empty value means the default), "none", or a comma list such as "my,km,lo,vi". Measured
+    on real FLEURS speech, Gemini made 2-7x fewer character errors than Whisper `base` in every language
+    and was faster per clip; live Vietnamese through Whisper dropped 26 of 29 slices and returned nonsense."""
+    if language is None:
+        return False
+    if language in _GEMINI_STT_LANGUAGES:
+        return True
+    setting = (os.getenv("POLYGLOT_GEMINI_STT_LANGUAGES") or "all").strip().lower()
+    if setting == "all":
+        return language in config.TARGET_LANGUAGES
+    if setting == "none":
+        return False
+    return language in {code.strip() for code in setting.split(",")}
+
+
+# Whisper runs on the CPU and one inference already uses every core: when Gemini fails for a language
+# Whisper can read, the fallback transcriptions must not pile up on top of each other.
+_WHISPER_FALLBACK_LOCK = threading.Lock()
+
+
 def _pcm_window_to_wav_bytes(window: Any, sample_rate: int) -> bytes:
     """Wrap a Whisper-loaded float32 audio window as an in-memory 16-bit PCM
     WAV file - the format Gemini's generateContent audio input expects."""
@@ -322,7 +346,8 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
     Audio decoding still loads the file; this is incremental inference,
     not a streaming media decoder.
     """
-    whisper, model = _load_whisper(model_name, need_model=language not in _GEMINI_STT_LANGUAGES)
+    use_gemini = gemini_first(language)
+    whisper, model = _load_whisper(model_name, need_model=not use_gemini)
     audio = whisper.load_audio(str(path))
     sample_rate = whisper.audio.SAMPLE_RATE
     # condition_on_previous_text=False: Whisper's default feeds each
@@ -347,19 +372,31 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
         # use Gemini's own audio transcription. If it is unavailable, leave a
         # gap: Whisper's attempt at these languages is fluent-looking
         # nonsense that would then be translated into eight other languages.
-        if language in _GEMINI_STT_LANGUAGES:
+        use_whisper_fallback = False
+        if use_gemini:
             if _window_is_unusable(window, sample_rate):
                 continue  # silence, not a failure: nothing to transcribe, nothing missed
             gemini_text = _transcribe_window_via_gemini(window, sample_rate, language)
-            if gemini_text is None:
+            if gemini_text is not None:
+                if gemini_text:
+                    yield gemini_text, _pcm16(window), language
+                continue
+            if language in _GEMINI_STT_LANGUAGES:
                 LOG.warning("Skipping a %s window: Gemini transcription unavailable", language)
                 if on_unrecognized:
                     on_unrecognized()
-            elif gemini_text:
-                yield gemini_text, _pcm16(window), language
-            continue
+                continue
+            # Whisper can read this language, so an unavailable Gemini costs accuracy, not the caption.
+            LOG.warning("Gemini transcription unavailable for a %s window; using Whisper for it", language)
+            use_whisper_fallback = True
+            if model is None:
+                whisper, model = _load_whisper(model_name)
 
-        result = model.transcribe(window, fp16=False, condition_on_previous_text=False, language=language)
+        if use_whisper_fallback:
+            with _WHISPER_FALLBACK_LOCK:
+                result = model.transcribe(window, fp16=False, condition_on_previous_text=False, language=language)
+        else:
+            result = model.transcribe(window, fp16=False, condition_on_previous_text=False, language=language)
         detected = result.get("language")
         pieces = []
         for segment in result.get("segments", []):

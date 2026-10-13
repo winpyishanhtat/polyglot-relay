@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import statistics
 import time
@@ -103,21 +104,29 @@ def wav_seconds(path: str) -> float | None:
 def default_transcriber(model_name: str = "base", stt: str = "default") -> Callable[[str, str], tuple[str, int]]:
     """The relay's own speech-to-text: (text, windows Gemini could not transcribe).
 
-    stt="default" is what the relay does (Gemini for Burmese/Khmer/Lao, Whisper for the rest);
-    stt="gemini" sends every language to Gemini, to compare it with Whisper."""
+    stt="default" is exactly what the relay does (see stt_service.gemini_first: Gemini first, with
+    Whisper as the fallback for languages it can read); "gemini" is Gemini only, no fallback;
+    "whisper" is Whisper for every language it can read, to compare with Gemini."""
     import stt_service
 
     def transcribe(path: str, language: str) -> tuple[str, int]:
         gaps = [0]
         original = stt_service._GEMINI_STT_LANGUAGES
+        saved_setting = os.environ.get("POLYGLOT_GEMINI_STT_LANGUAGES")
         if stt == "gemini":
             stt_service._GEMINI_STT_LANGUAGES = frozenset(original) | {language}
+        elif stt == "whisper":
+            os.environ["POLYGLOT_GEMINI_STT_LANGUAGES"] = "none"
         try:
             pieces = [text for text, _pcm, _lang in stt_service.transcribe_file(
                 pathlib.Path(path), model_name, language=language,
                 on_unrecognized=lambda: gaps.__setitem__(0, gaps[0] + 1))]
         finally:
             stt_service._GEMINI_STT_LANGUAGES = original
+            if saved_setting is None:
+                os.environ.pop("POLYGLOT_GEMINI_STT_LANGUAGES", None)
+            else:
+                os.environ["POLYGLOT_GEMINI_STT_LANGUAGES"] = saved_setting
         return " ".join(pieces), gaps[0]
     return transcribe
 
@@ -249,8 +258,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--langs", nargs="*", help="only these language codes")
     parser.add_argument("--limit", type=int, help="at most this many clips per language")
     parser.add_argument("--model", default="base", help="Whisper model for the languages Whisper reads")
-    parser.add_argument("--stt", choices=["default", "gemini"], default="default",
-                        help="gemini: transcribe every language with Gemini instead of Whisper (asr only)")
+    parser.add_argument("--stt", choices=["default", "gemini", "whisper"], default="default",
+                        help="default: the relay's own choice; gemini: Gemini only, no fallback; "
+                             "whisper: Whisper for every language it can read (asr only)")
     parser.add_argument("--from-asr", type=pathlib.Path, help="mt only: translate this asr run's output")
     args = parser.parse_args(argv)
 
