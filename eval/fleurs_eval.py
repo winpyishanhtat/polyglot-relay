@@ -100,15 +100,24 @@ def wav_seconds(path: str) -> float | None:
         return None
 
 
-def default_transcriber(model_name: str = "base") -> Callable[[str, str], tuple[str, int]]:
-    """The relay's own speech-to-text: (text, windows Gemini could not transcribe)."""
-    from stt_service import transcribe_file
+def default_transcriber(model_name: str = "base", stt: str = "default") -> Callable[[str, str], tuple[str, int]]:
+    """The relay's own speech-to-text: (text, windows Gemini could not transcribe).
+
+    stt="default" is what the relay does (Gemini for Burmese/Khmer/Lao, Whisper for the rest);
+    stt="gemini" sends every language to Gemini, to compare it with Whisper."""
+    import stt_service
 
     def transcribe(path: str, language: str) -> tuple[str, int]:
         gaps = [0]
-        pieces = [text for text, _pcm, _lang in transcribe_file(
-            pathlib.Path(path), model_name, language=language,
-            on_unrecognized=lambda: gaps.__setitem__(0, gaps[0] + 1))]
+        original = stt_service._GEMINI_STT_LANGUAGES
+        if stt == "gemini":
+            stt_service._GEMINI_STT_LANGUAGES = frozenset(original) | {language}
+        try:
+            pieces = [text for text, _pcm, _lang in stt_service.transcribe_file(
+                pathlib.Path(path), model_name, language=language,
+                on_unrecognized=lambda: gaps.__setitem__(0, gaps[0] + 1))]
+        finally:
+            stt_service._GEMINI_STT_LANGUAGES = original
         return " ".join(pieces), gaps[0]
     return transcribe
 
@@ -240,12 +249,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--langs", nargs="*", help="only these language codes")
     parser.add_argument("--limit", type=int, help="at most this many clips per language")
     parser.add_argument("--model", default="base", help="Whisper model for the languages Whisper reads")
+    parser.add_argument("--stt", choices=["default", "gemini"], default="default",
+                        help="gemini: transcribe every language with Gemini instead of Whisper (asr only)")
     parser.add_argument("--from-asr", type=pathlib.Path, help="mt only: translate this asr run's output")
     args = parser.parse_args(argv)
 
     items = load_manifest(args.manifest, args.langs, args.limit)
     if args.mode == "asr":
-        results = run_asr(items, default_transcriber(args.model))
+        results = run_asr(items, default_transcriber(args.model, args.stt))
         summary = summarize_asr(results)
         table = markdown_table(summary, ASR_COLUMNS)
     else:

@@ -2,8 +2,9 @@
 
     python -m eval.summarize_results --results D:/data/fleurs/results --out report.md
 
-Reads asr_<lang>.json, mt_ref_<lang>.json (translation from the reference transcript) and
-mt_e2e_<lang>.json (translation from the recognised text), whichever exist.
+Reads asr_<lang>.json, mt_ref_<lang>.json (translation from the reference transcript),
+mt_e2e_<lang>.json (translation from the recognised text) and asr_gemini_<lang>.json (the same
+clips transcribed by Gemini instead of Whisper), whichever exist.
 """
 from __future__ import annotations
 
@@ -31,15 +32,16 @@ def build_rows(results: pathlib.Path) -> list[dict]:
     rows = []
     for lang in LANGUAGE_ORDER:
         asr, ref, e2e = _load(results, "asr", lang), _load(results, "mt_ref", lang), _load(results, "mt_e2e", lang)
-        if not (asr or ref or e2e):
+        gemini = _load(results, "asr_gemini", lang)
+        if not (asr or ref or e2e or gemini):
             continue
-        rows.append({"lang": lang, "asr": asr, "mt_ref": ref, "mt_e2e": e2e})
+        rows.append({"lang": lang, "asr": asr, "mt_ref": ref, "mt_e2e": e2e, "asr_gemini": gemini})
     return rows
 
 
 def markdown(rows: list[dict]) -> str:
-    lines = ["| Language | Clips | CER % (95% CI) | WER % | Empty | Median s | RTF | chrF++ from reference | chrF++ end to end |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| Language | Clips | CER % (95% CI) | WER % | Empty | Median s | RTF | chrF++ from reference | chrF++ end to end | CER % if Gemini transcribes |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for row in rows:
         asr, ref, e2e = row["asr"], row["mt_ref"], row["mt_e2e"]
         cells = [row["lang"]]
@@ -51,6 +53,8 @@ def markdown(rows: list[dict]) -> str:
             cells += ["-"] * 6
         for mt in (ref, e2e):
             cells.append(_ci(mt["chrf_pp"], mt.get("chrf_pp_ci95")) if mt else "-")
+        gem = row.get("asr_gemini")
+        cells.append(_ci(gem["cer_percent"], gem.get("cer_ci95")) if gem else "-")
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 

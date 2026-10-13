@@ -242,6 +242,40 @@ class AsrRunTests(unittest.TestCase):
         self.assertLessEqual(low, summary["cer_percent"])
         self.assertGreaterEqual(high, summary["cer_percent"])
 
+    def test_gemini_mode_sends_the_language_to_gemini_and_restores_the_setting_afterwards(self):
+        import stt_service
+        seen = []
+
+        def fake_transcribe_file(path, model, language=None, on_unrecognized=None):
+            seen.append(language in stt_service._GEMINI_STT_LANGUAGES)
+            yield "text", b"", language
+        before = frozenset(stt_service._GEMINI_STT_LANGUAGES)
+        with mock.patch("stt_service.transcribe_file", fake_transcribe_file):
+            fleurs_eval.default_transcriber("base", "gemini")("clip.wav", "th")
+            fleurs_eval.default_transcriber("base", "default")("clip.wav", "th")
+        self.assertEqual(seen, [True, False])
+        self.assertEqual(stt_service._GEMINI_STT_LANGUAGES, before)
+
+    def test_the_setting_is_restored_even_if_transcription_fails(self):
+        import stt_service
+        before = frozenset(stt_service._GEMINI_STT_LANGUAGES)
+
+        def boom(path, model, language=None, on_unrecognized=None):
+            raise RuntimeError("quota")
+            yield
+        with mock.patch("stt_service.transcribe_file", boom), self.assertRaises(RuntimeError):
+            fleurs_eval.default_transcriber("base", "gemini")("clip.wav", "vi")
+        self.assertEqual(stt_service._GEMINI_STT_LANGUAGES, before)
+
+    def test_the_command_line_passes_the_stt_choice_through(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        (tmp / "m.jsonl").write_text(json.dumps({"id": "th-1", "lang": "th", "audio": "a.wav", "transcript": "abcd"}) + "\n", encoding="utf-8")
+        with mock.patch.object(fleurs_eval, "default_transcriber", return_value=lambda p, l: ("abcd", 0)) as factory, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            fleurs_eval.main(["asr", "--manifest", str(tmp / "m.jsonl"), "--out", str(tmp / "o.json"), "--stt", "gemini"])
+        factory.assert_called_once_with("base", "gemini")
+
     def test_default_transcriber_collects_windows_and_gaps(self):
         def fake_transcribe_file(path, model, language=None, on_unrecognized=None):
             on_unrecognized()
@@ -345,7 +379,7 @@ class SummaryTableTests(unittest.TestCase):
         self.write("mt_ref_id.json", "id", {"chrf_pp": 68.4, "chrf_pp_ci95": [66.3, 70.4]})
         self.write("mt_e2e_id.json", "id", {"chrf_pp": 60.1, "chrf_pp_ci95": [58.0, 62.2]})
         line = summarize_results.markdown(summarize_results.build_rows(self.dir)).splitlines()[2]
-        self.assertEqual(line, "| id | 150 | 4.0 (3.0-5.0) | 9.5 (8.0-11.0) | 1 | 2.5 | 0.2 | 68.4 (66.3-70.4) | 60.1 (58.0-62.2) |")
+        self.assertEqual(line, "| id | 150 | 4.0 (3.0-5.0) | 9.5 (8.0-11.0) | 1 | 2.5 | 0.2 | 68.4 (66.3-70.4) | 60.1 (58.0-62.2) | - |")
 
     def test_word_error_rate_is_not_reported_for_scripts_without_word_spaces(self):
         for lang in ("my", "th", "km", "lo"):
@@ -356,7 +390,18 @@ class SummaryTableTests(unittest.TestCase):
     def test_missing_parts_show_as_dashes(self):
         self.write("mt_ref_vi.json", "vi", {"chrf_pp": 62.0, "chrf_pp_ci95": [60.0, 64.0]})
         line = summarize_results.markdown(summarize_results.build_rows(self.dir)).splitlines()[2]
-        self.assertEqual(line, "| vi | - | - | - | - | - | - | 62.0 (60.0-64.0) | - |")
+        self.assertEqual(line, "| vi | - | - | - | - | - | - | 62.0 (60.0-64.0) | - | - |")
+
+    def test_the_gemini_transcription_comparison_gets_its_own_column(self):
+        self.asr("th")
+        self.write("asr_gemini_th.json", "th", {"utterances": 150, "cer_percent": 7.8, "cer_ci95": [5.4, 10.9]})
+        line = summarize_results.markdown(summarize_results.build_rows(self.dir)).splitlines()[2]
+        self.assertTrue(line.endswith("| 7.8 (5.4-10.9) |"), line)
+
+    def test_a_language_with_only_the_gemini_run_still_appears(self):
+        self.write("asr_gemini_tl.json", "tl", {"utterances": 150, "cer_percent": 4.6, "cer_ci95": [3.8, 5.4]})
+        rows = summarize_results.build_rows(self.dir)
+        self.assertEqual([r["lang"] for r in rows], ["tl"])
 
     def test_command_line_writes_the_table(self):
         self.asr("en")
