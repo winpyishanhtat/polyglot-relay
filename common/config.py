@@ -9,9 +9,13 @@ from __future__ import annotations
 import os
 
 
+# How many broker replicas the cluster runs (ids 1..N; the highest live id leads - Bully election).
+# Two is the minimum for failover; three survives losing two in turn. Empty means the default.
+BROKER_COUNT = max(1, min(7, int(os.getenv("POLYGLOT_BROKER_COUNT") or "2")))
 BROKERS = [
-    {"id": 1, "host": os.getenv("POLYGLOT_BROKER_1_HOST", "127.0.0.1"), "port": int(os.getenv("POLYGLOT_BROKER_1_PORT", "7001"))},
-    {"id": 2, "host": os.getenv("POLYGLOT_BROKER_2_HOST", "127.0.0.1"), "port": int(os.getenv("POLYGLOT_BROKER_2_PORT", "7002"))},
+    {"id": number, "host": os.getenv(f"POLYGLOT_BROKER_{number}_HOST") or "127.0.0.1",
+     "port": int(os.getenv(f"POLYGLOT_BROKER_{number}_PORT") or str(7000 + number))}
+    for number in range(1, BROKER_COUNT + 1)
 ]
 
 # Single source of truth for every language the relay can translate into.
@@ -33,12 +37,18 @@ LANGUAGES: dict[str, dict[str, str]] = {
 }
 TARGET_LANGUAGES = list(LANGUAGES.keys())
 AUDIO_CHUNK_SECONDS = float(os.getenv("POLYGLOT_AUDIO_CHUNK_SECONDS", "2.5"))
-HEARTBEAT_INTERVAL = float(os.getenv("POLYGLOT_HEARTBEAT_INTERVAL", "2"))
-HEARTBEAT_TIMEOUT = float(os.getenv("POLYGLOT_HEARTBEAT_TIMEOUT", "6"))
-ELECTION_TIMEOUT = float(os.getenv("POLYGLOT_ELECTION_TIMEOUT", "2"))
-CONNECT_TIMEOUT = float(os.getenv("POLYGLOT_CONNECT_TIMEOUT", "1.5"))
+# Failure-detection timing. Measured with eval.failover_trials (time from killing the leader to a new one):
+#   interval 2 / timeout 6 / election 2 / connect 1.5 -> 8.25 s   (the old defaults)
+#   interval 1 / timeout 3 / election 1 / connect 1   -> 4.77 s   (these defaults: three missed heartbeats)
+#   interval 0.5 / timeout 2 / election 1 / connect .75 -> 3.01 s  (faster, but four missed beats of 0.5 s
+#                                                          can misfire when the host is starved of CPU)
+# Empty or unset environment values mean the default.
+HEARTBEAT_INTERVAL = float(os.getenv("POLYGLOT_HEARTBEAT_INTERVAL") or "1")
+HEARTBEAT_TIMEOUT = float(os.getenv("POLYGLOT_HEARTBEAT_TIMEOUT") or "3")
+ELECTION_TIMEOUT = float(os.getenv("POLYGLOT_ELECTION_TIMEOUT") or "1")
+CONNECT_TIMEOUT = float(os.getenv("POLYGLOT_CONNECT_TIMEOUT") or "1")
 RECONNECT_DELAY = float(os.getenv("POLYGLOT_RECONNECT_DELAY", "1"))
-WORKER_STALE_TIMEOUT = float(os.getenv("POLYGLOT_WORKER_STALE_TIMEOUT", "7"))
+WORKER_STALE_TIMEOUT = float(os.getenv("POLYGLOT_WORKER_STALE_TIMEOUT") or "4")
 DEFAULT_WORKER_HOST = os.getenv("POLYGLOT_WORKER_HOST", "127.0.0.1")
 DEFAULT_WORKER_BIND_HOST = os.getenv("POLYGLOT_WORKER_BIND_HOST", DEFAULT_WORKER_HOST)
 DEFAULT_WORKER_PORT_BASE = int(os.getenv("POLYGLOT_WORKER_PORT_BASE", "8100"))

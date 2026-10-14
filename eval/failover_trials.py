@@ -59,34 +59,51 @@ def wait_until(condition, timeout: float, interval: float = 0.025) -> float | No
     return None
 
 
-def run_trial(env_overrides: dict[str, str] | None = None, settle_timeout: float = 30.0,
-              recovery_timeout: float = 60.0) -> float:
-    """One kill-the-leader trial; returns the seconds to a new leader. Raises on a failed setup
-    or on no recovery, so a broken run is never averaged in."""
-    ports = {1: free_port(), 2: free_port()}
+def run_chain(env_overrides: dict[str, str] | None = None, brokers: int = 2, kills: int = 1,
+              settle_timeout: float = 30.0, recovery_timeout: float = 60.0) -> list[float]:
+    """Start `brokers` real brokers, then kill the leader `kills` times in a row, timing each recovery
+    (seconds until the next-highest id reports itself leader). Raises on a failed setup or on no
+    recovery, so a broken run is never averaged in."""
+    if not 1 <= kills < brokers:
+        raise ValueError("kills must be at least 1 and fewer than the number of brokers")
+    ports = {number: free_port() for number in range(1, brokers + 1)}
     env = os.environ.copy()
-    env.update(POLYGLOT_BROKER_1_HOST="127.0.0.1", POLYGLOT_BROKER_2_HOST="127.0.0.1",
-               POLYGLOT_BROKER_1_PORT=str(ports[1]), POLYGLOT_BROKER_2_PORT=str(ports[2]))
+    env["POLYGLOT_BROKER_COUNT"] = str(brokers)
+    for number, port in ports.items():
+        env[f"POLYGLOT_BROKER_{number}_HOST"] = "127.0.0.1"
+        env[f"POLYGLOT_BROKER_{number}_PORT"] = str(port)
     env.pop("POLYGLOT_BROKER_BIND_HOST", None)
     env.update(env_overrides or {})
-    procs = {i: subprocess.Popen([sys.executable, "broker.py", "--id", str(i)], cwd=ROOT, env=env,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for i in (1, 2)}
+    procs = {number: subprocess.Popen([sys.executable, "broker.py", "--id", str(number)], cwd=ROOT, env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for number in ports}
     try:
         def settled() -> bool:
-            leader, follower = heartbeat(ports[2]), heartbeat(ports[1])
-            return bool(leader and leader.get("is_leader") and follower and follower.get("leader_id") == 2)
+            top = heartbeat(ports[brokers])
+            if not (top and top.get("is_leader")):
+                return False
+            return all((heartbeat(ports[n]) or {}).get("leader_id") == brokers for n in range(1, brokers))
         if wait_until(settled, settle_timeout) is None:
-            raise RuntimeError("the brokers never agreed on broker 2 as leader")
-        procs[2].kill()
-        killed_at = time.monotonic()
-        procs[2].wait(timeout=5)
+            raise RuntimeError(f"the brokers never agreed on broker {brokers} as leader")
+        times = []
+        leader = brokers
+        for _ in range(kills):
+            procs[leader].kill()
+            killed_at = time.monotonic()
+            procs[leader].wait(timeout=5)
+            successor = leader - 1
 
-        def recovered() -> bool:
-            answer = heartbeat(ports[1])
-            return bool(answer and answer.get("is_leader"))
-        if wait_until(recovered, recovery_timeout) is None:
-            raise RuntimeError("broker 1 never became leader after the leader was killed")
-        return time.monotonic() - killed_at
+            def recovered(successor=successor) -> bool:
+                answer = heartbeat(ports[successor])
+                return bool(answer and answer.get("is_leader"))
+            if wait_until(recovered, recovery_timeout) is None:
+                raise RuntimeError(f"broker {successor} never became leader after broker {leader} was killed")
+            times.append(time.monotonic() - killed_at)
+            leader = successor
+            if _ != kills - 1:   # let the survivors agree before the next kill
+                if wait_until(lambda: all((heartbeat(ports[n]) or {}).get("leader_id") == leader for n in range(1, leader)),
+                              settle_timeout) is None:
+                    raise RuntimeError("the surviving brokers never agreed on the new leader")
+        return times
     finally:
         for proc in procs.values():
             if proc.poll() is None:
@@ -95,6 +112,12 @@ def run_trial(env_overrides: dict[str, str] | None = None, settle_timeout: float
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+
+
+def run_trial(env_overrides: dict[str, str] | None = None, settle_timeout: float = 30.0,
+              recovery_timeout: float = 60.0) -> float:
+    """One kill-the-leader trial with two brokers; returns the seconds to a new leader."""
+    return run_chain(env_overrides, 2, 1, settle_timeout, recovery_timeout)[0]
 
 
 def summarize(times: list[float]) -> dict:
@@ -124,14 +147,16 @@ def timing_settings(env_overrides: dict[str, str] | None = None) -> dict[str, fl
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--trials", type=int, default=10)
+    parser.add_argument("--brokers", type=int, default=2, help="how many broker replicas to start")
+    parser.add_argument("--kills", type=int, default=1, help="how many leaders to kill in a row per trial")
     parser.add_argument("--out", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
     times: list[float] = []
     for number in range(1, args.trials + 1):
-        seconds = run_trial()
-        times.append(seconds)
-        print(f"trial {number}/{args.trials}: new leader after {seconds:.2f}s", flush=True)
-    result = {"settings": timing_settings(), "recovery_seconds": [round(t, 3) for t in times],
+        chain = run_chain(None, args.brokers, args.kills)
+        times.extend(chain)
+        print(f"trial {number}/{args.trials}: new leader after " + ", then ".join(f"{t:.2f}s" for t in chain), flush=True)
+    result = {"settings": timing_settings(), "brokers": args.brokers, "kills_per_trial": args.kills, "recovery_seconds": [round(t, 3) for t in times],
               "summary": summarize(times)}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

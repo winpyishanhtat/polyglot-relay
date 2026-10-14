@@ -5,6 +5,10 @@ x-common-environment: &common-environment
   POLYGLOT_BROKER_1_PORT: "7001"
   POLYGLOT_BROKER_2_HOST: broker-2
   POLYGLOT_BROKER_2_PORT: "7002"
+  POLYGLOT_BROKER_3_HOST: broker-3
+  POLYGLOT_BROKER_3_PORT: "7003"
+  # Three replicas: the cluster keeps working after losing two of them in turn.
+  POLYGLOT_BROKER_COUNT: "3"
   POLYGLOT_BROKER_BIND_HOST: 0.0.0.0
   POLYGLOT_WORKER_BIND_HOST: 0.0.0.0
 
@@ -19,6 +23,8 @@ x-worker-dependencies: &worker-dependencies
   broker-1:
     condition: service_healthy
   broker-2:
+    condition: service_healthy
+  broker-3:
     condition: service_healthy
 
 services:
@@ -44,6 +50,17 @@ services:
     ports: ["127.0.0.1:7002:7002"]
     healthcheck:
       test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7002"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  broker-3:
+    <<: *app
+    command: ["python", "broker.py", "--id", "3"]
+    ports: ["127.0.0.1:7003:7003"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7003"]
       interval: 2s
       timeout: 2s
       retries: 10

@@ -75,6 +75,36 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([b["id"] for b in config.BROKERS], [1, 2])
         self.assertEqual(len({b["port"] for b in config.BROKERS}), 2)
 
+    def configured(self, **env):
+        """The broker list a fresh process sees with this environment (config is read at import)."""
+        import os
+        import subprocess
+        code = "import json; from common import config; print(json.dumps(config.BROKERS))"
+        out = subprocess.run([sys.executable, "-c", code], env={**os.environ, **env}, capture_output=True, text=True, check=True).stdout
+        return json.loads(out)
+
+    def test_two_brokers_by_default_and_the_count_is_configurable(self):
+        self.assertEqual([b["id"] for b in self.configured(POLYGLOT_BROKER_COUNT="")], [1, 2])
+        three = self.configured(POLYGLOT_BROKER_COUNT="3", POLYGLOT_BROKER_3_HOST="broker-3", POLYGLOT_BROKER_3_PORT="7003")
+        self.assertEqual([(b["id"], b["port"]) for b in three], [(1, 7001), (2, 7002), (3, 7003)])
+        self.assertEqual(three[2]["host"], "broker-3")
+
+    def test_the_broker_count_is_kept_in_a_sane_range(self):
+        self.assertEqual(len(self.configured(POLYGLOT_BROKER_COUNT="0")), 1)
+        self.assertEqual(len(self.configured(POLYGLOT_BROKER_COUNT="99")), 7)
+
+    def test_empty_timing_values_fall_back_to_the_defaults_as_compose_passes_unset_ones(self):
+        code = "from common import config; print(config.HEARTBEAT_INTERVAL, config.HEARTBEAT_TIMEOUT, config.ELECTION_TIMEOUT, config.CONNECT_TIMEOUT, config.WORKER_STALE_TIMEOUT)"
+        import os
+        import subprocess
+        env = {**os.environ, "POLYGLOT_HEARTBEAT_INTERVAL": "", "POLYGLOT_HEARTBEAT_TIMEOUT": "", "POLYGLOT_ELECTION_TIMEOUT": "",
+               "POLYGLOT_CONNECT_TIMEOUT": "", "POLYGLOT_WORKER_STALE_TIMEOUT": ""}
+        out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual(out, ["1.0", "3.0", "1.0", "1.0", "4.0"])
+
+    def test_the_new_defaults_tolerate_two_missed_heartbeats(self):
+        self.assertGreaterEqual(config.HEARTBEAT_TIMEOUT / config.HEARTBEAT_INTERVAL, 3)
+
     def test_broker_by_id_returns_a_copy(self):
         broker = config.broker_by_id(2)
         broker["port"] = 1

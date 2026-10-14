@@ -451,14 +451,37 @@ class FailoverToolTests(unittest.TestCase):
 
     def test_command_line_runs_the_requested_number_of_trials(self):
         out = pathlib.Path(tempfile.mkdtemp()) / "failover.json"
-        with mock.patch.object(failover_trials, "run_trial", side_effect=[7.5, 8.5, 9.5]) as run, \
+        with mock.patch.object(failover_trials, "run_chain", side_effect=[[7.5], [8.5], [9.5]]) as run, \
                 mock.patch("sys.stdout", new_callable=io.StringIO):
             failover_trials.main(["--trials", "3", "--out", str(out)])
         self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args.args[1:], (2, 1))            # two brokers, one kill by default
         saved = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(saved["recovery_seconds"], [7.5, 8.5, 9.5])
         self.assertEqual(saved["summary"]["median_seconds"], 8.5)
         self.assertIn("POLYGLOT_HEARTBEAT_TIMEOUT", saved["settings"])
+
+    def test_command_line_can_kill_several_leaders_in_a_row_across_three_brokers(self):
+        out = pathlib.Path(tempfile.mkdtemp()) / "failover3.json"
+        with mock.patch.object(failover_trials, "run_chain", side_effect=[[4.8, 5.1], [4.7, 5.0]]) as run, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            failover_trials.main(["--trials", "2", "--brokers", "3", "--kills", "2", "--out", str(out)])
+        self.assertEqual(run.call_args.args[1:], (3, 2))
+        saved = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual((saved["brokers"], saved["kills_per_trial"]), (3, 2))
+        self.assertEqual(saved["recovery_seconds"], [4.8, 5.1, 4.7, 5.0])
+
+    def test_a_chain_needs_fewer_kills_than_brokers(self):
+        for brokers, kills in ((2, 2), (3, 3), (2, 0)):
+            with self.assertRaises(ValueError):
+                failover_trials.run_chain(None, brokers, kills)
+
+    def test_three_brokers_hand_leadership_down_the_chain(self):
+        fast = {"POLYGLOT_HEARTBEAT_INTERVAL": "0.2", "POLYGLOT_HEARTBEAT_TIMEOUT": "0.6",
+                "POLYGLOT_ELECTION_TIMEOUT": "0.2", "POLYGLOT_CONNECT_TIMEOUT": "0.2"}
+        times = failover_trials.run_chain(fast, brokers=3, kills=2, settle_timeout=20, recovery_timeout=20)
+        self.assertEqual(len(times), 2)                  # broker 2 took over, then broker 1
+        self.assertTrue(all(0.05 < t < 8.0 for t in times), times)
 
 
 if __name__ == "__main__":
