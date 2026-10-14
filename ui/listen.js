@@ -47,6 +47,7 @@
   // ---- the page ----------------------------------------------------------------------------------
 
   const $ = (id) => document.getElementById(id);
+  $("listen-fallback").hidden = true;       // the scripts loaded, so the page is being served by the relay
   let accessToken = "";
   try {
     accessToken = new URLSearchParams(window.location.search).get("token") || sessionStorage.getItem("polyglot-token") || "";

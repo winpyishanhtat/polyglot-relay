@@ -18,6 +18,13 @@
     </header>
 
     <main class="listen-main">
+      <!-- Shown only when the scripts did not load, e.g. this file opened from disk instead of through the relay. -->
+      <section id="listen-fallback" style="font-family: system-ui, sans-serif; max-width: 34em; margin: 12vh auto; padding: 0 16px">
+        <h1>This page needs the relay</h1>
+        <p>It cannot run from a file on disk. Start the relay, then open
+          <a href="http://localhost:8000/listen">http://localhost:8000/listen</a>
+          (or <code>/listen/th</code>, <code>/listen/my</code>, ... for one language).</p>
+      </section>
       <section id="listen-picker" hidden>
         <h1>Choose your language</h1>
         <p class="lede">Captions appear here as they are spoken, translated into the language you pick.</p>
