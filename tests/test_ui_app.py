@@ -26,6 +26,9 @@ class DashboardScriptTests(unittest.TestCase):
     def test_listen_js_merges_and_orders_captions(self):
         self.run_node_tests("listen.test.js")
 
+    def test_the_listener_page_behaves_correctly_against_a_fake_dom(self):
+        self.run_node_tests("listen_page.test.js")
+
 
 if __name__ == "__main__":
     unittest.main()

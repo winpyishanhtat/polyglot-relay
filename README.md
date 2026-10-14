@@ -49,7 +49,7 @@ Two broker replicas run a real **Bully leader-election** protocol; translator wo
 - **Web dashboard** — upload/record audio or send typed text, watch all 9 language feeds and cluster health live
 - **Listener page** — `/listen` shows every sentence in all the languages you pick at once, and can read one aloud
 - **At-least-once delivery** — a caption is never lost to a dead worker or broker (see "Delivery guarantees")
-- **Over 750 automated tests** (plus 80 for the browser scripts) covering the protocol, election, delivery, translation routing and the dashboard
+- **Over 800 automated tests** (plus 110 for the browser scripts) covering the protocol, election, delivery, translation routing and the dashboard
 
 ## Quick start
 
@@ -228,11 +228,11 @@ python -m unittest discover -s tests -v
 ```
 
 or inside Docker: `docker compose --profile test run --rm tests`. The Docker image is stdlib-only, so
-tests that need numpy, the Gemini SDK or Node are skipped there (about 59 of 766); run the suite natively
+tests that need numpy, the Gemini SDK or Node are skipped there (about 62 of 803); run the suite natively
 to execute everything.
 
 Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built-in runner
-(`node --test tests/js/app.test.js tests/js/speech.test.js tests/js/listen.test.js`; they are also part of the Python run when `node` is installed).
+(`node --test tests/js/*.test.js` on a shell that expands the pattern, or list the four files; they are also part of the Python run when `node` is installed).
 
 | Area | Test files |
 |---|---|
@@ -244,8 +244,19 @@ Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built
 | Caption history: store, time/language/text filters, exports, routes | `test_history.py` |
 | History on disk, viewing token, listener pages, read-aloud endpoint and speech module | `test_web_features.py` |
 | Delivery: redelivery, waiting jobs, replication, balancing, acknowledgements, caching | `test_delivery.py`, `test_acks.py`, `test_translation_cache.py` |
-| Dashboard page, listener page, speech helper and live slicer (JavaScript) | `test_ui_app.py` + `tests/js/`, `test_live_slicer.py` |
+| Dashboard page, listener page (logic and DOM), speech helper and live slicer (JavaScript) | `test_ui_app.py` + `tests/js/`, `test_live_slicer.py` |
+| Retry limits, shutdown, command-line entry points, English-pivot decision | `test_edges.py` |
+| The smoke-test tool, against stub relays and a real mock cluster | `test_smoke_tool.py` |
 | Rate gate, evaluation metrics, evaluation runner, failover trials | `test_gemini_rate_gate.py`, `test_gate_and_eval.py`, `test_evaluation.py`, `test_eval_harness.py` |
+
+### Checking a running system
+
+`python tools/smoke_test.py` (add `--url http://HOST:8000` and `--token ...` as needed) sends one typed caption
+through the live pipeline and checks that exactly one broker leads, every language has a connected worker, the
+dashboard and listener pages are served, all nine translations come back, and the history and export contain the
+caption. It prints PASS/FAIL for each check and exits non-zero if any failed, so it can gate a deployment. Add
+`--speech` to also test read-aloud (it spends Gemini speech quota). The caption stays in the history until you
+use **Clear captions & history**.
 
 To see coverage: `pip install coverage`, then
 `python -m coverage run --branch --source=. --omit="tests/*,tools/*" -m unittest discover -s tests`
