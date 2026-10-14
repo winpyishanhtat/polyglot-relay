@@ -224,7 +224,7 @@ python -m unittest discover -s tests -v
 ```
 
 or inside Docker: `docker compose --profile test run --rm tests`. The Docker image is stdlib-only, so
-tests that need numpy, the Gemini SDK or Node are skipped there (about 55 of 486); run the suite natively
+tests that need numpy, the Gemini SDK or Node are skipped there (about 59 of 766); run the suite natively
 to execute everything.
 
 Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built-in runner

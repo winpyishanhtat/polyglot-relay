@@ -227,6 +227,10 @@ services:
 
   tests:
     <<: *app
+    # The suite builds its own brokers; it must not inherit the stack's three-broker address list.
+    environment:
+      <<: *common-environment
+      POLYGLOT_BROKER_COUNT: ""
     build:
       context: .
       target: test
