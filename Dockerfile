@@ -75,7 +75,7 @@ COPY --chown=polyglot:polyglot . /app
 # volume takes its initial ownership from whatever the image has at that
 # path (root, if nothing's there yet) - without this, the polyglot user
 # (which the container actually runs as) can't write the downloaded model.
-RUN mkdir -p /home/polyglot/.cache/whisper && chown -R polyglot:polyglot /home/polyglot/.cache
+RUN mkdir -p /home/polyglot/.cache/whisper /data && chown -R polyglot:polyglot /home/polyglot/.cache /data
 USER polyglot
 CMD ["python", "broker.py", "--id", "1"]
 

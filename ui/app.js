@@ -10,6 +10,12 @@ try {
 function authHeaders(headers = {}) {
   return accessToken ? { ...headers, "X-Access-Token": accessToken } : headers;
 }
+// Reads a caption aloud: the browser's own voice when it has one for the language, else the relay's /api/tts.
+const speaker = window.PolyglotSpeech ? window.PolyglotSpeech.createSpeaker({
+  speechSynthesis: window.speechSynthesis, SpeechSynthesisUtterance: window.SpeechSynthesisUtterance,
+  fetch: (...args) => fetch(...args), Audio: window.Audio, URL: window.URL,
+  headers: () => authHeaders({ "Content-Type": "application/json" }),
+}) : null;
 const toast = $("#toast");
 let toastTimer;
 let lastCaptionSignature = "";
@@ -349,7 +355,20 @@ function renderCaptions(captions, workers) {
       const worker = document.createElement("span");
       worker.className = `backend-tag backend-${item.translation_backend || "relay"}`;
       worker.textContent = item.translation_backend === "passthrough" ? "same language" : (item.translation_backend || item.worker_id || "relay");
-      meta.append(time, worker);
+      meta.append(time);
+      if (speaker) {
+        const listen = document.createElement("button");
+        listen.type = "button";
+        listen.className = "text-button speak-button";
+        listen.textContent = "Listen";
+        listen.setAttribute("aria-label", `Read ${item.number ? `caption ${item.number}` : "this caption"} aloud`);
+        listen.addEventListener("click", () => {
+          speaker.stop();
+          speaker.speak(item.text, lang).catch((error) => { if (error.message !== "stopped") showToast(error.message); });
+        });
+        meta.append(listen);
+      }
+      meta.append(worker);
       article.append(meta);
       return article;
     });

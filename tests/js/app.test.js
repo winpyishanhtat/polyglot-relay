@@ -59,7 +59,7 @@ const LANGUAGES = ["en", "my", "id", "ms", "th", "vi", "tl", "km", "lo"].map((co
   code, name: code.toUpperCase() + "-name", native: code, group: "ASEAN",
 }));
 
-function load({ fetchImpl, search, stored } = {}) {
+function load({ fetchImpl, search, stored, speech = false } = {}) {
   const registry = new Map();
   const get = (selector) => {
     if (!registry.has(selector)) registry.set(selector, new FakeElement());
@@ -101,6 +101,7 @@ function load({ fetchImpl, search, stored } = {}) {
   vm.createContext(sandbox);
   // live_slicer.js is a classic script that defines LiveSlicer globally for app.js.
   vm.runInContext(fs.readFileSync(path.join(UI, "live_slicer.js"), "utf8"), sandbox, { filename: "live_slicer.js" });
+  if (speech) vm.runInContext(fs.readFileSync(path.join(UI, "speech.js"), "utf8"), sandbox, { filename: "speech.js" });
   vm.runInContext(fs.readFileSync(path.join(UI, "app.js"), "utf8"), sandbox, { filename: "app.js" });
   const run = (code) => vm.runInContext(code, sandbox);
   return { sandbox, registry, get, calls, run };
@@ -743,4 +744,62 @@ test("scrolling a live card up pins it and scrolling back down releases it", asy
   feed.scrollTop = 2760;
   for (const handler of feed.listeners.scroll || []) handler({});
   assert.equal(feed.dataset.pinned, "");
+});
+
+// ---- reading captions aloud ---------------------------------------------------------------
+
+function findAll(element, predicate, found = []) {
+  if (predicate(element)) found.push(element);
+  for (const child of element.children) findAll(child, predicate, found);
+  return found;
+}
+
+async function bootedWithSpeech() {
+  const page = load({ speech: true });
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+  return page;
+}
+
+test("each caption gets a Listen button when the speech helper is loaded", async () => {
+  const { sandbox, get } = await bootedWithSpeech();
+  get('.caption-card[data-lang="th"]');
+  const feed = get("#captions-th");
+  sandbox.renderCaptions({ th: [caption({ number: 4, text: "one" }), caption({ number: 5, text: "two", chunk_id: "d" })] }, {});
+  const buttons = findAll(feed, (e) => e.className.includes("speak-button"));
+  assert.equal(buttons.length, 2);
+  assert.equal(buttons[0].textContent, "Listen");
+  assert.equal(buttons[0].attributes["aria-label"], "Read caption 4 aloud");
+});
+
+test("there is no Listen button, and nothing breaks, without the speech helper", async () => {
+  const { sandbox, get } = await booted();
+  get('.caption-card[data-lang="th"]');
+  const feed = get("#captions-th");
+  sandbox.renderCaptions({ th: [caption()] }, {});
+  assert.equal(findAll(feed, (e) => e.className.includes("speak-button")).length, 0);
+});
+
+test("pressing Listen asks the relay to speak that caption in its language", async () => {
+  const { sandbox, get, calls } = await bootedWithSpeech();
+  get('.caption-card[data-lang="km"]');
+  const feed = get("#captions-km");
+  sandbox.renderCaptions({ km: [caption({ text: "hello in khmer" })] }, {});
+  const [button] = findAll(feed, (e) => e.className.includes("speak-button"));
+  await button.click();
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+  const [, options] = calls.find(([url]) => url === "/api/tts");
+  assert.equal(options.method, "POST");
+  assert.deepEqual(JSON.parse(options.body), { text: "hello in khmer", lang: "km" });
+});
+
+test("the Listen request carries the access token when the page was opened with one", async () => {
+  const page = load({ speech: true, search: "?token=s3cret" });
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+  page.get('.caption-card[data-lang="th"]');
+  page.sandbox.renderCaptions({ th: [caption()] }, {});
+  const [button] = findAll(page.get("#captions-th"), (e) => e.className.includes("speak-button"));
+  await button.click();
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+  const [, options] = page.calls.find(([url]) => url === "/api/tts");
+  assert.equal(options.headers["X-Access-Token"], "s3cret");
 });

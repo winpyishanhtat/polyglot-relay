@@ -108,7 +108,10 @@
       <section class="captions-section" aria-labelledby="captions-title">
         <div class="section-heading">
           <div><h2 id="captions-title">Live captions</h2></div>
-          <button id="clear-button" class="text-button" type="button">Clear captions &amp; history</button>
+          <span class="heading-actions">
+            <a class="text-button" href="/listen">Listener pages</a>
+            <button id="clear-button" class="text-button" type="button">Clear captions &amp; history</button>
+          </span>
         </div>
         <div id="group-tabs" class="group-tabs" role="tablist" aria-label="Filter by language group"></div>
         <div class="caption-grid" id="caption-grid"></div>
@@ -158,6 +161,7 @@
     <footer><span>Polyglot Relay</span><span>Fault-tolerant by design · Built for every voice</span></footer>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/live_slicer.js" defer></script>
+    <script src="/speech.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>

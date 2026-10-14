@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import history as caption_history
+import tts
 from common import config
 from common import netutil
 from common.discovery import discover_worker
@@ -69,6 +70,13 @@ def access_token() -> str:
     leaves the dashboard open, as it always was; read per request so it can be set
     without a code change."""
     return os.getenv("POLYGLOT_ACCESS_TOKEN") or ""
+
+
+def view_token() -> str:
+    """Optional secret needed to *see* anything (POLYGLOT_VIEW_TOKEN). Open a link ending in ?token=...
+    once and a cookie remembers it; the access token is accepted too, so whoever runs the room can also
+    watch it. Empty leaves viewing open. /health is always open for the container health check."""
+    return os.getenv("POLYGLOT_VIEW_TOKEN") or ""
 
 
 def rate_limit_per_minute() -> int:
@@ -132,6 +140,20 @@ class DashboardState:
         self._history_max = max(10, int(os.getenv("POLYGLOT_HISTORY_CHUNKS") or "2000"))
         self._history_max_age = max(0.0, float(os.getenv("POLYGLOT_HISTORY_MINUTES") or "0")) * 60
         self._lock = threading.RLock()
+        # Optional: keep the history on disk so a restart does not lose it (POLYGLOT_HISTORY_FILE).
+        history_file = os.getenv("POLYGLOT_HISTORY_FILE") or ""
+        self._store = caption_history.HistoryStore(history_file, self._history_max, LOG) if history_file else None
+        if self._store:
+            self.history = self._store.load()
+            self._trim_history(time.time())
+            self.sequence = max((row.get("number") or 0 for row in self.history.values()), default=0)
+            if self.history:
+                LOG.info("Restored %d captions from %s", len(self.history), history_file)
+
+    def _persist(self, chunk_id: str) -> None:
+        row = self.history.get(chunk_id)
+        if self._store and row is not None:
+            self._store.save(row, self.history.values())
 
     def event(self, message: str, kind: str = "info") -> None:
         with self._lock:
@@ -150,6 +172,7 @@ class DashboardState:
             row = self._history_row(chunk_id, now)
             row.update(number=self.sequence, text=text, source_lang=source_lang or "auto", created_at=now)
             self._trim_history(now)
+            self._persist(chunk_id)
             self.chunks[chunk_id] = {"chunk_id": chunk_id, "number": self.sequence,
                 "text": text, "source_lang": source_lang, "created_at": now,
                 "targets": {lang: {"status": "source" if lang == source_lang else "awaiting_broker"}
@@ -218,6 +241,7 @@ class DashboardState:
                                              "worker_id": message.get("worker_id"),
                                              "timestamp": float(message.get("timestamp", time.time()))}
                 self._trim_history(time.time())
+                self._persist(chunk_id)
             self.captions[lang].appendleft({
                 "chunk_id": chunk_id,
                 "text": str(message.get("text", "")),
@@ -243,6 +267,8 @@ class DashboardState:
             for captions in self.captions.values():
                 captions.clear()
             self.history.clear()
+            if self._store:
+                self._store.wipe()
         self.event("Caption history cleared")
 
     def snapshot(self) -> dict[str, Any]:
@@ -697,6 +723,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        self._remember_viewer(getattr(self, "_cookie_to_set", None))
         self.end_headers()
         self.wfile.write(payload)
 
@@ -800,25 +827,84 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    VIEW_COOKIE = "polyglot_view"
+
+    def _supplied_view_credential(self) -> tuple[str, bool]:
+        """(token the request carries, whether it arrived in the address - which earns a cookie)."""
+        header = self.headers.get("X-View-Token") or self.headers.get("X-Access-Token")
+        if header:
+            return header, False
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        if query.get("token"):
+            return query["token"][0], True
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == self.VIEW_COOKIE:
+                return urllib.parse.unquote(value), False
+        return "", False
+
+    def _may_view(self) -> tuple[bool, str | None]:
+        """Whether this request may read. Second value: a token to remember in a cookie, when the address carried it."""
+        required = view_token()
+        if not required:
+            return True, None
+        supplied, from_address = self._supplied_view_credential()
+        accepted = [t for t in (required, access_token()) if t]
+        if supplied and any(hmac.compare_digest(supplied.encode("utf-8"), t.encode("utf-8")) for t in accepted):
+            return True, supplied if from_address else None
+        return False, None
+
+    def _refuse_viewer(self) -> None:
+        wants_page = not urllib.parse.urlsplit(self.path).path.startswith("/api/")
+        if wants_page:
+            payload = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+                       "<title>Polyglot Relay</title><body style='font:16px system-ui;max-width:32em;margin:15vh auto;padding:0 16px'>"
+                       "<h1>This room is private</h1><p>Open the link you were given - it ends in <code>?token=...</code>.</p>"
+                       ).encode("utf-8")
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        else:
+            self._json({"error": "A viewing token is required"}, HTTPStatus.UNAUTHORIZED)
+
+    def _remember_viewer(self, token: str | None) -> None:
+        if token:
+            self.send_header("Set-Cookie", f"{self.VIEW_COOKIE}={urllib.parse.quote(token, safe='')}; Path=/; HttpOnly; SameSite=Lax")
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/health":
+            return self._json({"status": "ok"})
+        allowed, remember = self._may_view()
+        if not allowed:
+            return self._refuse_viewer()
+        self._cookie_to_set = remember
         if parsed.path == "/api/history":
             return self._history(parsed.query, export=False)
         if parsed.path == "/api/export":
             return self._history(parsed.query, export=True)
-        if self.path == "/api/status":
+        if parsed.path == "/api/status":
             return self._json(self.runtime.status())
-        if self.path == "/api/captions":
+        if parsed.path == "/api/captions":
             return self._json(self.runtime.state.snapshot()["captions"])
-        if self.path == "/api/languages":
+        if parsed.path == "/api/languages":
             languages = [{"code": code, **meta} for code, meta in config.LANGUAGES.items()]
             return self._json({"languages": languages})
-        if self.path == "/health":
-            return self._json({"status": "ok"})
-        route = "/index.html" if self.path == "/" else self.path.split("?", 1)[0]
+        route = "/index.html" if parsed.path == "/" else parsed.path
+        if route in ("/listen", "/listen/"):
+            route = "/listen.html"
+        elif route.startswith("/listen/"):
+            if route[len("/listen/"):] not in config.TARGET_LANGUAGES:
+                return self.send_error(HTTPStatus.NOT_FOUND)
+            route = "/listen.html"
         files = {"/index.html": ("index.html", "text/html; charset=utf-8"),
+                 "/listen.html": ("listen.html", "text/html; charset=utf-8"),
                  "/app.css": ("app.css", "text/css; charset=utf-8"),
                  "/live_slicer.js": ("live_slicer.js", "text/javascript; charset=utf-8"),
+                 "/speech.js": ("speech.js", "text/javascript; charset=utf-8"),
+                 "/listen.js": ("listen.js", "text/javascript; charset=utf-8"),
                  "/app.js": ("app.js", "text/javascript; charset=utf-8")}
         if route not in files:
             return self.send_error(HTTPStatus.NOT_FOUND)
@@ -827,18 +913,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        self._remember_viewer(remember)
         self.end_headers()
         self.wfile.write(payload)
 
     def _authorized(self) -> bool:
         token = access_token()
         if not token:
-            return True
+            # Only a viewing token is set: whoever may watch may also drive the room.
+            return self._may_view()[0]
         supplied = self.headers.get("X-Access-Token", "")
         return hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
 
+    def _may_speak(self) -> bool:
+        """POST /api/tts spends the Gemini key, so when any token is set it needs one: the access token
+        (the operator) or the viewing token (a listener). It is open only when neither is set."""
+        if not access_token() and not view_token():
+            return True
+        if self.headers.get("X-Access-Token") and self._authorized():
+            return True
+        return bool(view_token()) and self._may_view()[0]
+
     def do_POST(self) -> None:  # noqa: N802
-        if not self._authorized():
+        self._cookie_to_set = None
+        speak = urllib.parse.urlsplit(self.path).path == "/api/tts"
+        if not (self._may_speak() if speak else self._authorized()):
             self._discard_body()
             return self._json({"error": "Access token required"}, HTTPStatus.UNAUTHORIZED)
         wait = self.limiter.allow(self.client_address[0], rate_limit_per_minute())
@@ -853,6 +952,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         try:
+            if speak:
+                return self._speak()
             if self.path == "/api/captions":
                 body = self._body()
                 self.runtime.submit(str(body.get("text", "")), body.get("source_lang") or None)
@@ -880,6 +981,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json({"error": str(exc), "dropped": True}, HTTPStatus.TOO_MANY_REQUESTS)
         except (ValueError, json.JSONDecodeError) as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def _speak(self) -> None:
+        body = self._body()
+        try:
+            wav = tts.SYNTHESIZER.synthesize(str(body.get("text", "")), str(body.get("lang", "")))
+        except tts.TtsError as exc:
+            return self._json({"error": str(exc)}, HTTPStatus(exc.status))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.end_headers()
+        self.wfile.write(wav)
 
     def log_message(self, format: str, *args: Any) -> None:
         LOG.debug("HTTP %s", format % args)

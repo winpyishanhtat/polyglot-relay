@@ -11,6 +11,13 @@ x-common-environment: &common-environment
   POLYGLOT_BROKER_COUNT: "3"
   POLYGLOT_BROKER_BIND_HOST: 0.0.0.0
   POLYGLOT_WORKER_BIND_HOST: 0.0.0.0
+  # Delivery tuning (empty = the built-in default; see README, "Delivery guarantees").
+  POLYGLOT_JOB_TIMEOUT: ${POLYGLOT_JOB_TIMEOUT:-}
+  POLYGLOT_MAX_DELIVERY_ATTEMPTS: ${POLYGLOT_MAX_DELIVERY_ATTEMPTS:-}
+  POLYGLOT_WAITING_MAX_AGE: ${POLYGLOT_WAITING_MAX_AGE:-}
+  POLYGLOT_REPLICATION_INTERVAL: ${POLYGLOT_REPLICATION_INTERVAL:-}
+  POLYGLOT_REPLAY_DELAY: ${POLYGLOT_REPLAY_DELAY:-}
+  POLYGLOT_TRANSLATION_CACHE: ${POLYGLOT_TRANSLATION_CACHE:-}
 
 x-app: &app
   image: polyglot-relay:mock
@@ -180,6 +187,8 @@ services:
     # it every time.
     volumes:
       - whisper-cache:/home/polyglot/.cache/whisper
+      # Where POLYGLOT_HISTORY_FILE=/data/history.jsonl keeps the caption history across restarts.
+      - ui-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1)"]
       interval: 3s
@@ -231,3 +240,4 @@ networks:
 
 volumes:
   whisper-cache:
+  ui-data:

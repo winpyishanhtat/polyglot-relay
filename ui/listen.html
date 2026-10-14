@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#FFEEC8">
+    <title>Polyglot Relay — Listen</title>
+    <meta name="description" content="Follow the live captions in one language, on your own phone or screen.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,380;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body class="listen-page">
+    <header class="listen-bar">
+      <a class="listen-home" href="/listen" id="listen-home">Polyglot Relay</a>
+      <span id="listen-state" class="network-pill"><i></i><span>Connecting</span></span>
+    </header>
+
+    <main class="listen-main">
+      <section id="listen-picker" hidden>
+        <h1>Choose your language</h1>
+        <p class="lede">Captions appear here as they are spoken, translated into the language you pick.</p>
+        <div id="listen-choices" class="listen-choices"></div>
+      </section>
+
+      <section id="listen-view" hidden>
+        <div class="listen-head">
+          <div>
+            <h1 id="listen-title">—</h1>
+            <span id="listen-native" class="native"></span>
+          </div>
+          <div class="listen-tools">
+            <button type="button" class="button secondary" id="listen-smaller" aria-label="Smaller text">A−</button>
+            <button type="button" class="button secondary" id="listen-larger" aria-label="Larger text">A+</button>
+            <button type="button" class="button primary" id="listen-speak" aria-pressed="false">Read aloud</button>
+          </div>
+        </div>
+        <p id="listen-note" class="listen-note" role="status"></p>
+        <div id="listen-latest" class="listen-latest" role="log" aria-live="polite"><p class="empty">Waiting for the first caption…</p></div>
+        <h2 id="listen-earlier-heading" class="listen-earlier-heading" hidden>Earlier</h2>
+        <div id="listen-earlier" class="listen-earlier"></div>
+      </section>
+    </main>
+
+    <script src="/speech.js" defer></script>
+    <script src="/listen.js" defer></script>
+  </body>
+</html>

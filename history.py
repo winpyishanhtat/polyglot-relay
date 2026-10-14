@@ -12,8 +12,11 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+import threading
 import time
-from collections.abc import Sequence
+from collections import OrderedDict
+from collections.abc import Iterable, Sequence
 
 from common import config
 
@@ -94,3 +97,86 @@ def to_srt(rows: Sequence[dict], lang: str, max_seconds: float = 8.0, tail_secon
 
 FORMATS = {"txt": ("text/plain; charset=utf-8", "txt"), "csv": ("text/csv; charset=utf-8", "csv"),
            "json": ("application/json; charset=utf-8", "json"), "srt": ("application/x-subrip; charset=utf-8", "srt")}
+
+
+class HistoryStore:
+    """Optional on-disk copy of the caption history (POLYGLOT_HISTORY_FILE), so a restart does not lose it.
+
+    One JSON line per update of a row; a later line for the same chunk replaces an earlier one when the
+    file is read back. The file is rewritten compactly once it holds many more lines than rows. A failing
+    disk never stops captions: the first error is logged and writing is retried on the next update."""
+
+    COMPACT_FACTOR = 4
+
+    def __init__(self, path: str, max_rows: int, logger=None) -> None:
+        self.path = path
+        self.max_rows = max_rows
+        self.log = logger
+        self._lock = threading.Lock()
+        self._lines = 0
+        self._failing = False
+
+    def load(self) -> "OrderedDict[str, dict]":
+        rows: OrderedDict[str, dict] = OrderedDict()
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                for line in handle:
+                    self._lines += 1
+                    try:
+                        row = json.loads(line)
+                        chunk_id = row["chunk_id"]
+                        float(row["created_at"])
+                        if not isinstance(row.get("translations"), dict):
+                            raise ValueError("translations")
+                    except (ValueError, KeyError, TypeError):
+                        continue               # a torn last line after a crash, or hand editing: skip it
+                    rows.pop(chunk_id, None)
+                    rows[chunk_id] = row
+        except FileNotFoundError:
+            return rows
+        except OSError as exc:
+            self._report(f"cannot read {self.path}: {exc}")
+            return rows
+        ordered = sorted(rows.values(), key=lambda r: (r["created_at"], r.get("number") or 0))
+        return OrderedDict((r["chunk_id"], r) for r in ordered[-self.max_rows:])
+
+    def save(self, row: dict, rows: "Iterable[dict] | None" = None) -> None:
+        """Append `row`. `rows` (every current row) is used only when the file needs compacting."""
+        line = json.dumps(row, ensure_ascii=False)
+        with self._lock:
+            try:
+                directory = os.path.dirname(self.path)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                if rows is not None and self._lines > self.COMPACT_FACTOR * self.max_rows:
+                    self._rewrite(rows)
+                else:
+                    with open(self.path, "a", encoding="utf-8") as handle:
+                        handle.write(line + "\n")
+                    self._lines += 1
+                self._failing = False
+            except OSError as exc:
+                self._report(f"cannot write {self.path}: {exc}")
+
+    def wipe(self) -> None:
+        with self._lock:
+            try:
+                open(self.path, "w", encoding="utf-8").close()
+                self._lines = 0
+            except OSError as exc:
+                self._report(f"cannot clear {self.path}: {exc}")
+
+    def _rewrite(self, rows: "Iterable[dict]") -> None:
+        temporary = self.path + ".tmp"
+        count = 0
+        with open(temporary, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                count += 1
+        os.replace(temporary, self.path)
+        self._lines = count
+
+    def _report(self, message: str) -> None:
+        if not self._failing and self.log:
+            self.log.warning("History file: %s", message)
+        self._failing = True

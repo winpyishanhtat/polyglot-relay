@@ -47,7 +47,9 @@ Two broker replicas run a real **Bully leader-election** protocol; translator wo
 - **Whisper transcription** with hallucination filtering (two independent confidence signals, not just "does this look empty")
 - **Self-healing** — dead leader → automatic election; dead worker → its pool keeps running; both invisible to listeners
 - **Web dashboard** — upload/record audio or send typed text, watch all 9 language feeds and cluster health live
-- **65 automated tests** covering the protocol, election, translation routing, and the dashboard
+- **Listener pages** — `/listen/<code>` shows one language in large type for a phone, and can read it aloud
+- **At-least-once delivery** — a caption is never lost to a dead worker or broker (see "Delivery guarantees")
+- **Over 750 automated tests** (plus 80 for the browser scripts) covering the protocol, election, delivery, translation routing and the dashboard
 
 ## Quick start
 
@@ -123,9 +125,25 @@ The defaults suit one person on one machine. Before others can reach it:
 4. The broker (7001/7002) and LibreTranslate (5001) ports are published on `127.0.0.1` only, because
    the broker protocol has no authentication. Do not expose them.
 5. Audio and text are sent to the Gemini API: tell speakers and check Google's current terms for
-   your tier. Captions are held in memory only and are not written to disk.
+   your tier. Captions are held in memory only unless you set `POLYGLOT_HISTORY_FILE` (see History).
+6. To make *viewing* private too, set `POLYGLOT_VIEW_TOKEN`. Every page and read then needs it, and
+   `/health` stays open. Share listener links as `https://HOST/listen/th?token=THE_TOKEN`; the first visit
+   stores it in an HttpOnly cookie. The access token also opens the room, so the presenter can watch it,
+   but a viewer's token never allows changes. With both set, viewers read and listen, the presenter changes.
 
 This is still one shared room per dashboard: everyone sees the same captions.
+
+## Listener pages and read-aloud
+
+`/listen` lists the nine languages and `/listen/th` (any code) shows that language alone: the newest caption
+in large type with the spoken original beneath it, the previous ones smaller, and **A−/A+** to resize.
+**Read aloud** speaks each new caption (it skips ahead rather than fall behind). The browser's own voice is
+used when it has one for the language; otherwise the page asks `POST /api/tts`, which returns a WAV made by
+Gemini speech (`GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`; repeated phrases are cached). Browsers rarely have
+Burmese, Khmer or Lao voices, so those usually use the relay's. Free-tier keys allow only about 10 speech
+requests per day per model, and the page shows Google's message when that runs out. Every caption card on the
+main dashboard also has a **Listen** button. `/api/tts` needs a token when one is set, and is rate limited
+like every other POST.
 
 ## Brokers and failover
 
@@ -163,8 +181,12 @@ chunks, optionally limited by age with `POLYGLOT_HISTORY_MINUTES`). Choose a tim
 minutes, the whole session, or a custom from/to), the languages to read, and a search term, then export what
 you see as text, CSV (opens in Excel with Burmese, Thai and Khmer intact), JSON or SRT subtitles. The same
 data is available at `/api/history` and `/api/export` (`since`, `until`, `last_minutes`, `langs`, `q`,
-`limit`, `format`, `lang`). History is held in memory only: a restart or **Clear captions & history**
-empties it, so export anything you need to keep.
+`limit`, `format`, `lang`). By default history is held in memory only: a restart or **Clear captions &
+history** empties it. Set `POLYGLOT_HISTORY_FILE` (the Compose stack mounts a volume at `/data`, so
+`/data/history.jsonl` works) to keep it across restarts: each update is appended as one JSON line, the file
+is compacted when it grows, a damaged line is skipped, and a disk error is logged once without stopping
+captions. **Clear captions & history** empties the file too. The file holds everything that was said, so
+treat it as private.
 
 ## Evaluating it
 
@@ -206,7 +228,7 @@ tests that need numpy, the Gemini SDK or Node are skipped there (about 55 of 486
 to execute everything.
 
 Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built-in runner
-(`node --test tests/js/app.test.js`; they are also part of the Python run when `node` is installed).
+(`node --test tests/js/app.test.js tests/js/speech.test.js tests/js/listen.test.js`; they are also part of the Python run when `node` is installed).
 
 | Area | Test files |
 |---|---|
@@ -216,7 +238,9 @@ Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built
 | Speech-to-text: Whisper windows and filters, Gemini transcription, producer, CLI | `test_stt_service.py`, `test_stt_runtime.py`, `test_chunk_pipeline.py` |
 | Dashboard server: state, validation, listeners, broker status, HTTP routes, uploads, live slices | `test_web_ui.py`, `test_web_ui_extra.py` |
 | Caption history: store, time/language/text filters, exports, routes | `test_history.py` |
-| Dashboard page and live slicer (JavaScript) | `test_ui_app.py` + `tests/js/`, `test_live_slicer.py` |
+| History on disk, viewing token, listener pages, read-aloud endpoint and speech module | `test_web_features.py` |
+| Delivery: redelivery, waiting jobs, replication, balancing, acknowledgements, caching | `test_delivery.py`, `test_acks.py`, `test_translation_cache.py` |
+| Dashboard page, listener page, speech helper and live slicer (JavaScript) | `test_ui_app.py` + `tests/js/`, `test_live_slicer.py` |
 | Rate gate, evaluation metrics, evaluation runner, failover trials | `test_gemini_rate_gate.py`, `test_gate_and_eval.py`, `test_evaluation.py`, `test_eval_harness.py` |
 
 To see coverage: `pip install coverage`, then
