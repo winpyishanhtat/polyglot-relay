@@ -9,6 +9,7 @@ import socket
 import time
 
 from common import config
+from common import netutil
 from common.discovery import discover_worker
 from common.protocol import ProtocolError, decode_stream
 
@@ -23,7 +24,7 @@ def listen(lang: str) -> None:
             time.sleep(config.RECONNECT_DELAY)
             continue
         try:
-            with socket.create_connection((worker["host"], worker["port"]), config.CONNECT_TIMEOUT) as sock:
+            with netutil.connect(worker["host"], worker["port"], config.CONNECT_TIMEOUT) as sock:
                 sock.settimeout(None)
                 LOG.info("Connected to worker %s", worker["worker_id"])
                 for message in decode_stream(sock):

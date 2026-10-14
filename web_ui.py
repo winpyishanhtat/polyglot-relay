@@ -23,6 +23,7 @@ from typing import Any
 
 import history as caption_history
 from common import config
+from common import netutil
 from common.discovery import discover_worker
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
 from stt_service import DEMO_SENTENCES, TranscriptProducer, _load_whisper, gemini_first, transcribe_file
@@ -627,7 +628,7 @@ class DashboardRuntime:
                 self.stop_event.wait(config.RECONNECT_DELAY)
                 continue
             try:
-                with socket.create_connection((endpoint["host"], endpoint["port"]), config.CONNECT_TIMEOUT) as sock:
+                with netutil.connect(endpoint["host"], endpoint["port"], config.CONNECT_TIMEOUT) as sock:
                     sock.settimeout(None)
                     self.state.worker_status(lang, True, str(endpoint["worker_id"]))
                     for message in decode_stream(sock):
@@ -643,7 +644,7 @@ class DashboardRuntime:
         for broker in config.BROKERS:
             status = {"id": broker["id"], "online": False, "leader": False}
             try:
-                with socket.create_connection((broker["host"], broker["port"]), config.CONNECT_TIMEOUT) as sock:
+                with netutil.connect(broker["host"], broker["port"], config.CONNECT_TIMEOUT) as sock:
                     sock.settimeout(config.CONNECT_TIMEOUT)
                     sock.sendall(encode({"type": "heartbeat", "sender_id": "dashboard", "role": "broker"}))
                     response = recv_one(sock)

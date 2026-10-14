@@ -6,6 +6,7 @@ import socket
 from typing import Any
 
 from common import config
+from common import netutil
 from common.protocol import ProtocolError, encode, recv_one
 
 
@@ -15,7 +16,7 @@ def connect_to_leader(registration: dict[str, Any]) -> tuple[socket.socket, dict
     for broker in config.BROKERS:
         sock: socket.socket | None = None
         try:
-            sock = socket.create_connection((broker["host"], broker["port"]), config.CONNECT_TIMEOUT)
+            sock = netutil.connect(broker["host"], broker["port"], config.CONNECT_TIMEOUT)
             sock.settimeout(config.CONNECT_TIMEOUT)
             sock.sendall(encode(registration))
             response = recv_one(sock)
@@ -34,7 +35,7 @@ def discover_worker(lang: str) -> dict | None:
     """Query the current leader for one round-robin-selected worker endpoint."""
     for broker in config.BROKERS:
         try:
-            with socket.create_connection((broker["host"], broker["port"]), config.CONNECT_TIMEOUT) as sock:
+            with netutil.connect(broker["host"], broker["port"], config.CONNECT_TIMEOUT) as sock:
                 sock.settimeout(config.CONNECT_TIMEOUT)
                 sock.sendall(encode({"type": "discover_worker", "lang": lang}))
                 response = recv_one(sock)

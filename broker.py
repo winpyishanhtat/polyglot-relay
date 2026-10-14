@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from common import config
+from common import netutil
 from common.election import BullyElection
 from common.heartbeat import FailureDetector
 from common.protocol import ProtocolError, decode_stream, encode, recv_one
@@ -128,7 +129,7 @@ class Broker:
         if not peer:
             return None
         try:
-            with socket.create_connection((peer["host"], peer["port"]), config.CONNECT_TIMEOUT) as sock:
+            with netutil.connect(peer["host"], peer["port"], config.CONNECT_TIMEOUT) as sock:
                 sock.settimeout(config.CONNECT_TIMEOUT)
                 sock.sendall(encode(message))
                 return recv_one(sock)
