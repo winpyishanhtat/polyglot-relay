@@ -127,6 +127,17 @@ The defaults suit one person on one machine. Before others can reach it:
 
 This is still one shared room per dashboard: everyone sees the same captions.
 
+## Brokers and failover
+
+The Compose stack runs **three broker replicas** (`POLYGLOT_BROKER_COUNT=3`, ids 1-3; the highest live id
+leads, by Bully election), so it keeps working after losing two of them in turn. Measured on the live stack,
+stopping the leader gave a new one in 2.5 s, then 4.3 s for the next, with every worker staying connected.
+The defaults detect a dead leader after three missed 1 s heartbeats; for faster detection set
+`POLYGLOT_HEARTBEAT_INTERVAL=0.5` and `POLYGLOT_HEARTBEAT_TIMEOUT=2` (about 3 s, but it can misfire when the
+host is starved of CPU). Name lookups for a stopped container take about 4 s in Docker, so every connection
+to a broker or worker goes through `common/netutil.py`, which puts a deadline on the lookup and remembers
+failures for a few seconds; without it a dead broker froze the dashboard and slowed re-registration.
+
 ## History
 
 The live caption cards show the latest 50 captions per language and keep their scroll position. The
@@ -164,7 +175,8 @@ into one table.
 `mt` reports chrF++ against the human English translation. Both give 95% bootstrap intervals, and
 a clip that produced nothing scores as a total miss. chrF++ matches sacrebleu to 1e-14.
 `failover_trials` kills the leader N times and reports the distribution of time-to-new-leader
-(8.12 s, SD 0.03 s over 10 trials with the default 2 s heartbeat / 6 s timeout).
+(4.75 s, SD 0.02 s over 10 trials with the default 1 s heartbeat / 3 s timeout; the earlier 2 s / 6 s
+defaults took 8.12 s). `--brokers 3 --kills 2` kills the leader twice in a row (4.7 s, then 4.0 s).
 
 ## Testing
 
@@ -181,7 +193,7 @@ Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built
 
 | Area | Test files |
 |---|---|
-| Protocol, config, election, heartbeat, discovery, health check, listener client | `test_protocol.py`, `test_common_modules.py` |
+| Protocol, config, election, heartbeat, discovery, health check, listener client, name lookups | `test_protocol.py`, `test_common_modules.py`, `test_netutil.py` |
 | Broker: registry, handshake, routing, job telemetry, reaper, leadership | `test_broker.py`, `test_broker_server.py`, `test_cluster.py` (real processes) |
 | Translator worker: retry rules, Gemini text/Live calls, LibreTranslate, English pivot, worker process | `test_languages.py`, `test_gemini_translation.py`, `test_worker_runtime.py` |
 | Speech-to-text: Whisper windows and filters, Gemini transcription, producer, CLI | `test_stt_service.py`, `test_stt_runtime.py`, `test_chunk_pipeline.py` |
