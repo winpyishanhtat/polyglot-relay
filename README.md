@@ -47,7 +47,7 @@ Two broker replicas run a real **Bully leader-election** protocol; translator wo
 - **Whisper transcription** with hallucination filtering (two independent confidence signals, not just "does this look empty")
 - **Self-healing** — dead leader → automatic election; dead worker → its pool keeps running; both invisible to listeners
 - **Web dashboard** — upload/record audio or send typed text, watch all 9 language feeds and cluster health live
-- **Listener pages** — `/listen/<code>` shows one language in large type for a phone, and can read it aloud
+- **Listener page** — `/listen` shows every sentence in all the languages you pick at once, and can read one aloud
 - **At-least-once delivery** — a caption is never lost to a dead worker or broker (see "Delivery guarantees")
 - **Over 750 automated tests** (plus 80 for the browser scripts) covering the protocol, election, delivery, translation routing and the dashboard
 
@@ -133,13 +133,17 @@ The defaults suit one person on one machine. Before others can reach it:
 
 This is still one shared room per dashboard: everyone sees the same captions.
 
-## Listener pages and read-aloud
+## Listener page and read-aloud
 
-`/listen` lists the nine languages and `/listen/th` (any code) shows that language alone: the newest caption
-in large type with the spoken original beneath it, the previous ones smaller, and **A−/A+** to resize.
-**Read aloud** speaks each new caption (it skips ahead rather than fall behind). The browser's own voice is
-used when it has one for the language; otherwise the page asks `POST /api/tts`, which returns a WAV made by
-Gemini speech (`GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`; repeated phrases are cached). Browsers rarely have
+`/listen` shows what is being said in **several languages at the same time**: each spoken sentence appears
+once, with its translation in every language you have switched on underneath (side by side on a wide screen,
+stacked on a phone), filling in as each language arrives, with the previous sentences below. All nine are on
+by default; the language buttons switch any of them off or on and the choice is remembered. Share a link that
+starts with fewer: `/listen?langs=th,my,km`, or `/listen/th` for just Thai. **A−/A+** resizes the text.
+**Read aloud** speaks each new caption in the language you choose beside it (it skips ahead rather than fall
+behind). The browser's own voice is used when it has one for the language; otherwise the page asks
+`POST /api/tts`, which returns a WAV made by Gemini speech (`GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`; repeated
+phrases are cached). Browsers rarely have
 Burmese, Khmer or Lao voices, so those usually use the relay's. Free-tier keys allow only about 10 speech
 requests per day per model, and the page shows Google's message when that runs out. Every caption card on the
 main dashboard also has a **Listen** button. `/api/tts` needs a token when one is set, and is rate limited

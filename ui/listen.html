@@ -4,8 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#FFEEC8">
-    <title>Polyglot Relay — Listen</title>
-    <meta name="description" content="Follow the live captions in one language, on your own phone or screen.">
+    <title>Polyglot Relay — Live captions</title>
+    <meta name="description" content="Follow what is being said in several languages at once, on your own phone or screen.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,380;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -13,7 +13,7 @@
   </head>
   <body class="listen-page">
     <header class="listen-bar">
-      <a class="listen-home" href="/listen" id="listen-home">Polyglot Relay</a>
+      <a class="listen-home" href="/">Polyglot Relay</a>
       <span id="listen-state" class="network-pill"><i></i><span>Connecting</span></span>
     </header>
 
@@ -22,26 +22,22 @@
       <section id="listen-fallback" style="font-family: system-ui, sans-serif; max-width: 34em; margin: 12vh auto; padding: 0 16px">
         <h1>This page needs the relay</h1>
         <p>It cannot run from a file on disk. Start the relay, then open
-          <a href="http://localhost:8000/listen">http://localhost:8000/listen</a>
-          (or <code>/listen/th</code>, <code>/listen/my</code>, ... for one language).</p>
-      </section>
-      <section id="listen-picker" hidden>
-        <h1>Choose your language</h1>
-        <p class="lede">Captions appear here as they are spoken, translated into the language you pick.</p>
-        <div id="listen-choices" class="listen-choices"></div>
+          <a href="http://localhost:8000/listen">http://localhost:8000/listen</a>.</p>
       </section>
 
       <section id="listen-view" hidden>
         <div class="listen-head">
-          <div>
-            <h1 id="listen-title">—</h1>
-            <span id="listen-native" class="native"></span>
-          </div>
+          <h1>Live captions</h1>
           <div class="listen-tools">
             <button type="button" class="button secondary" id="listen-smaller" aria-label="Smaller text">A−</button>
             <button type="button" class="button secondary" id="listen-larger" aria-label="Larger text">A+</button>
+            <select id="listen-read-lang" aria-label="Language to read aloud" hidden></select>
             <button type="button" class="button primary" id="listen-speak" aria-pressed="false">Read aloud</button>
           </div>
+        </div>
+        <div class="listen-chips-row">
+          <span class="group-label">Languages</span>
+          <div id="listen-chips" class="history-langs" role="group" aria-label="Languages to show"></div>
         </div>
         <p id="listen-note" class="listen-note" role="status"></p>
         <div id="listen-latest" class="listen-latest" role="log" aria-live="polite"><p class="empty">Waiting for the first caption…</p></div>

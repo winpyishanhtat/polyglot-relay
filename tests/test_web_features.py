@@ -274,7 +274,7 @@ class ListenerPageTests(WebTestCase):
             self.assertEqual(self.call(path)[0], 404, path)
 
     def test_the_scripts_the_page_needs_are_served(self):
-        for path, marker in (("/speech.js", b"createSpeaker"), ("/listen.js", b"mergeRows")):
+        for path, marker in (("/speech.js", b"createSpeaker"), ("/listen.js", b"mergeChunks")):
             status, headers, body = self.call(path)
             self.assertEqual(status, 200)
             self.assertIn("javascript", headers["Content-Type"])
