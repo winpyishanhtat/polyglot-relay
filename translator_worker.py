@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 from common import config
@@ -198,6 +199,11 @@ class Translator:
         self.backend_preference = os.getenv("TRANSLATION_BACKEND", "auto")
         self.libretranslate_url = os.getenv("LIBRETRANSLATE_URL", "http://libretranslate:5000").rstrip("/")
         self._lt_supported: bool | None = None
+        # Translations already made (LRU). POLYGLOT_TRANSLATION_CACHE = entries per worker, 0 turns it off.
+        self._cache_size = max(0, int(os.getenv("POLYGLOT_TRANSLATION_CACHE") or "500"))
+        self._cache: OrderedDict[tuple, str] = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self.cache_hits = 0
         self._lt_checked_at = 0.0
         # A single broadcast fans out to every language pool at once (see
         # broker.route_chunk); on GEMINI_TIER=free, without spreading them
@@ -325,6 +331,37 @@ class Translator:
                 raise ValueError(f"Gemini Live requires 16 kHz PCM; received {audio_rate} Hz")
             audio = base64.b64decode(audio_pcm_b64, validate=True)
             return asyncio.run(self._translate_live(audio, known_source)), "gemini-live"
+        # A phrase heard before (a greeting, "thank you", a repeated line) is answered from memory: no API
+        # call, no quota. Keyed on the exact words, the spoken language and any shared English rendering.
+        cache_key = (known_source, " ".join(text.split()), pivot_en)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached, "cache"
+        translated, backend = self._translate_uncached(text, known_source, pivot_en)
+        if backend != "pivot":
+            self._cache_put(cache_key, translated)
+        return translated, backend
+
+    def _cache_get(self, key: tuple) -> str | None:
+        if not self._cache_size:
+            return None
+        with self._cache_lock:
+            value = self._cache.get(key)
+            if value is not None:
+                self._cache.move_to_end(key)
+                self.cache_hits += 1
+            return value
+
+    def _cache_put(self, key: tuple, value: str) -> None:
+        if not self._cache_size or not value.strip():
+            return
+        with self._cache_lock:
+            self._cache[key] = value
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+
+    def _translate_uncached(self, text: str, known_source: str | None, pivot_en: str | None) -> tuple[str, str]:
         # LibreTranslate has no Burmese/Khmer/Lao model, so it cannot READ
         # those either: asking it to translate FROM them just failed (after
         # three retries, ~2.4s) before every worker fell back to Gemini.
@@ -483,6 +520,12 @@ class TranslatorWorker:
         self._listeners_lock = threading.Lock()
         self._broker_send_lock = threading.Lock()
         self._work = queue.Queue(maxsize=100)
+        # The broker delivers at least once: after a worker loss or a broker failover the same chunk can
+        # arrive again. A chunk already queued or being translated is ignored, and one already finished gets
+        # its stored result sent again, so a repeat never costs a second translation.
+        self._dedupe_lock = threading.Lock()
+        self._queued_ids: set[str] = set()
+        self._finished: OrderedDict[str, dict] = OrderedDict()
 
     def serve(self) -> None:
         self._start_listener_server()
@@ -499,12 +542,7 @@ class TranslatorWorker:
                 threading.Thread(target=self._heartbeat_loop, args=(broker, heartbeat_stop), daemon=True).start()
                 for message in decode_stream(broker):
                     if message["type"] == "transcript_chunk":
-                        try:
-                            self._work.put_nowait((broker, message))
-                        except queue.Full:
-                            self._send_broker(broker, {"type": "chunk_status", "chunk_id": message["chunk_id"],
-                                "lang": self.lang, "worker_id": self.worker_id, "status": "failed",
-                                "detail": "Worker queue full; submit a shorter recording"})
+                        self._accept_chunk(broker, message)
                     elif message["type"] == "translated_chunk":
                         self._broadcast(message)
             except (OSError, ConnectionError, ProtocolError) as exc:
@@ -516,6 +554,28 @@ class TranslatorWorker:
                     broker.close()
             self.stop_event.wait(config.RECONNECT_DELAY)
 
+    def _accept_chunk(self, broker: socket.socket, message: dict) -> None:
+        chunk_id = str(message["chunk_id"])
+        with self._dedupe_lock:
+            if chunk_id in self._queued_ids:
+                LOG.info("Ignoring chunk %s: already queued or being translated", chunk_id)
+                return
+            stored = self._finished.get(chunk_id)
+            if stored is None:
+                self._queued_ids.add(chunk_id)
+        if stored is not None:
+            LOG.info("Chunk %s was already translated; sending the stored result again", chunk_id)
+            self._send_broker(broker, {**stored, "timestamp": time.time()})
+            return
+        try:
+            self._work.put_nowait((broker, message))
+        except queue.Full:
+            with self._dedupe_lock:
+                self._queued_ids.discard(chunk_id)
+            self._send_broker(broker, {"type": "chunk_status", "chunk_id": message["chunk_id"],
+                "lang": self.lang, "worker_id": self.worker_id, "status": "failed",
+                "detail": "Worker queue full; submit a shorter recording"})
+
     def _translation_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -526,6 +586,8 @@ class TranslatorWorker:
                 if broker.fileno() != -1:
                     self._process_chunk(broker, message)
             finally:
+                with self._dedupe_lock:
+                    self._queued_ids.discard(str(message.get("chunk_id")))
                 self._work.task_done()
 
     def _process_chunk(self, broker: socket.socket, message: dict) -> None:
@@ -545,6 +607,10 @@ class TranslatorWorker:
             result = {"type": "translated_chunk", "chunk_id": message["chunk_id"], "lang": self.lang,
                       "text": translated, "timestamp": time.time(),
                       "worker_id": self.worker_id, "translation_backend": backend}
+            with self._dedupe_lock:
+                self._finished[str(message["chunk_id"])] = result
+                while len(self._finished) > 500:
+                    self._finished.popitem(last=False)
             self._send_broker(broker, result)
             LOG.info("Translated chunk %s via %s", message["chunk_id"], backend)
         except Exception as exc:

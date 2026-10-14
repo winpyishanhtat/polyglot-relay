@@ -76,7 +76,7 @@ class TranscriptProducerTests(unittest.TestCase):
         sock = FakeSock()
         self.producer_with(sock).send("hello", "c1")
         message = frames(sock)[0]
-        self.assertEqual(set(message), {"type", "chunk_id", "text", "timestamp"})
+        self.assertEqual(set(message), {"type", "chunk_id", "text", "timestamp", "ack_id"})
         self.assertEqual(message["type"], "transcript_chunk")
 
     def test_optional_fields_are_attached_only_when_given(self):

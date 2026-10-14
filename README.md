@@ -138,6 +138,23 @@ host is starved of CPU). Name lookups for a stopped container take about 4 s in 
 to a broker or worker goes through `common/netutil.py`, which puts a deadline on the lookup and remembers
 failures for a few seconds; without it a dead broker froze the dashboard and slowed re-registration.
 
+### Delivery guarantees
+
+Every translation job is delivered **at least once**, and a failure never costs a caption:
+
+- The leader tracks each (chunk, language) job until a worker answers. If the worker disconnects, reports a
+  failure or sits on the job past `POLYGLOT_JOB_TIMEOUT`, the job goes to another worker for that language
+  (up to `POLYGLOT_MAX_DELIVERY_ATTEMPTS` tries). Jobs for a language with no worker wait, up to
+  `POLYGLOT_WAITING_MAX_AGE` seconds, and are delivered when one connects.
+- The leader mirrors in-flight and waiting jobs to the standby brokers, so a new leader replays them.
+- The speech-to-text side keeps every chunk until the leader acknowledges it (after routing and mirroring), and
+  sends it again to the next leader if the connection drops first.
+- Workers and the dashboard ignore duplicates, so a redelivered job is never shown twice.
+- Work goes to the worker with the fewest outstanding jobs for a language.
+- Repeated sentences are answered from a per-worker cache (`POLYGLOT_TRANSLATION_CACHE`, entries, 0 = off).
+- A broker that finds itself demoted drops its clients, and a leader yields to a higher live broker, so a
+  returning broker never leaves two leaders.
+
 ## History
 
 The live caption cards show the latest 50 captions per language and keep their scroll position. The

@@ -11,7 +11,7 @@ from typing import Any
 MESSAGE_TYPES = {
     "register", "register_ack", "transcript_chunk", "translated_chunk",
     "heartbeat", "heartbeat_ack", "election", "election_ok",
-    "leader_announce", "discover_worker", "worker_info", "error", "chunk_status",
+    "leader_announce", "discover_worker", "worker_info", "error", "chunk_status", "replicate_batch", "chunk_ack",
 }
 
 

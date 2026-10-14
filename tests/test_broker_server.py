@@ -451,8 +451,8 @@ class BackgroundLoopTests(unittest.TestCase):
             broker._leader_monitor()
         start.assert_called_once()
 
-    def test_the_leader_never_probes_itself(self):
-        broker = leader_broker()
+    def test_the_highest_broker_never_probes_anyone_while_it_leads(self):
+        broker = leader_broker(2)       # nobody has a higher id, so there is nobody to yield to
         broker._peer_request = mock.Mock(side_effect=AssertionError("leader probed a peer"))
         with mock.patch.object(config, "HEARTBEAT_INTERVAL", 0.01):
             thread = threading.Thread(target=broker._leader_monitor, daemon=True)

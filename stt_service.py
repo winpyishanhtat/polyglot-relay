@@ -13,12 +13,13 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from typing import Any
 
 from common import config
 from common.discovery import connect_to_leader
-from common.protocol import encode
+from common.protocol import ProtocolError, decode_stream, encode
 
 LOG = logging.getLogger("polyglot.stt")
 
@@ -30,27 +31,101 @@ DEMO_SENTENCES = [
 ]
 
 
+# How many un-acknowledged chunks a producer remembers to resend after a reconnect, and for how long.
+UNACKED_MAX = 300
+UNACKED_MAX_AGE = 120.0
+
+
 class TranscriptProducer:
+    """Sends transcript chunks to the leader broker and keeps each one until the broker acknowledges it, so a
+    leader that dies after reading a chunk (but before routing and mirroring it) costs nothing: the chunk is
+    sent again to the new leader, which ignores it if it already has it."""
+
     def __init__(self) -> None:
         self.sock: Any = None
         # A chunk may be sent from two threads (see web_ui's two-stage send);
         # one frame must never be interleaved with another on the socket.
         self._send_lock = threading.Lock()
+        self._unacked: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+        self._unacked_lock = threading.Lock()
+        self._closed = False
 
-    def _connect(self) -> None:
+    def _connect(self) -> bool:
+        """Make sure there is a connection. True when this call made a new one: everything still
+        un-acknowledged (including a chunk being sent right now) was resent on it."""
+        if self.sock is not None:
+            return False
         while self.sock is None:
+            if self._closed:
+                return False
             try:
-                self.sock, response = connect_to_leader({"type": "register", "role": "stt",
-                                                         "worker_id": f"stt-{uuid.uuid4().hex[:8]}"})
-                LOG.info("Connected to leader broker %s", response.get("leader_id"))
+                sock, response = connect_to_leader({"type": "register", "role": "stt",
+                                                    "worker_id": f"stt-{uuid.uuid4().hex[:8]}"})
             except ConnectionError as exc:
                 LOG.warning("No leader available (%s); retrying", exc)
                 time.sleep(config.RECONNECT_DELAY)
+                continue
+            LOG.info("Connected to leader broker %s", response.get("leader_id"))
+            with self._unacked_lock:
+                pending = [message for _, message in self._unacked.values()]
+            try:
+                for message in pending:
+                    sock.sendall(encode(message))
+            except OSError as exc:
+                LOG.warning("Resend after reconnecting failed (%s); rediscovering leader", exc)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                continue
+            self.sock = sock
+            threading.Thread(target=self._read_acks, args=(sock,), name="stt-acks", daemon=True).start()
+        return True
+
+    def _read_acks(self, sock: Any) -> None:
+        try:
+            for message in decode_stream(sock):
+                if message["type"] == "chunk_ack":
+                    with self._unacked_lock:
+                        self._unacked.pop(str(message.get("ack_id")), None)
+        except (OSError, ProtocolError):
+            pass
+        except Exception:  # not readable at all (a test double): nothing more to learn from it
+            return
+        self._connection_lost(sock)
+
+    def _connection_lost(self, sock: Any) -> None:
+        """The leader hung up. Reconnect now if chunks are still waiting for their acknowledgement, rather than
+        at the next send: a chunk written into a dead connection would otherwise vanish silently."""
+        with self._send_lock:
+            if self._closed or self.sock is not sock:
+                return
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self.sock = None
+            if self.unacknowledged():
+                LOG.warning("Leader connection lost with %d chunk(s) unacknowledged; reconnecting", self.unacknowledged())
+                self._connect()
+
+    def _remember(self, ack_id: str, message: dict) -> None:
+        now = time.monotonic()
+        with self._unacked_lock:
+            self._unacked[ack_id] = (now, message)
+            while len(self._unacked) > UNACKED_MAX or (
+                    self._unacked and now - next(iter(self._unacked.values()))[0] > UNACKED_MAX_AGE):
+                self._unacked.popitem(last=False)
+
+    def unacknowledged(self) -> int:
+        with self._unacked_lock:
+            return len(self._unacked)
 
     def send(self, text: str, chunk_id: str, audio_pcm: bytes | None = None,
              audio_rate: int = 16000, source_lang: str | None = None,
              pivot_en: str | None = None, targets: list[str] | None = None) -> None:
-        message = {"type": "transcript_chunk", "chunk_id": chunk_id,
+        ack_id = uuid.uuid4().hex[:12]
+        message = {"type": "transcript_chunk", "chunk_id": chunk_id, "ack_id": ack_id,
                    "text": text, "timestamp": time.time()}
         if audio_pcm:
             message["audio_pcm_b64"] = base64.b64encode(audio_pcm).decode("ascii")
@@ -61,9 +136,11 @@ class TranscriptProducer:
             message["pivot_en"] = pivot_en  # one shared English rendering for workers to reuse
         if targets is not None:
             message["targets"] = list(targets)  # route to only these languages
-        while True:
-            with self._send_lock:
-                self._connect()
+        with self._send_lock:
+            self._remember(ack_id, message)
+            while True:
+                if self._connect():
+                    return                  # a new connection resent everything un-acknowledged, this chunk included
                 try:
                     self.sock.sendall(encode(message))
                     return
@@ -76,6 +153,7 @@ class TranscriptProducer:
                     self.sock = None
 
     def close(self) -> None:
+        self._closed = True
         if self.sock:
             self.sock.close()
             self.sock = None
