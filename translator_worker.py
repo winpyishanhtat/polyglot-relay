@@ -21,8 +21,9 @@ from collections import OrderedDict
 from typing import Any
 
 from common import config
+import glossary
 from common.discovery import connect_to_leader
-from common.protocol import ProtocolError, decode_stream, encode
+from common.protocol import ProtocolError, authenticate, cluster_secret, decode_stream, encode, recv_one
 
 LOG = logging.getLogger("polyglot.worker")
 
@@ -158,6 +159,7 @@ def _libretranslate_get(url: str, timeout: float = 5.0):
 
 class Translator:
     def __init__(self, lang: str, mock: bool = False) -> None:
+        self.glossary = glossary.Glossary.from_env()   # POLYGLOT_GLOSSARY_FILE; re-read when it changes
         self.lang, self.mock, self._client = lang, mock, None
         self._client_lock = threading.Lock()
         self.report_status = lambda status, detail="": None
@@ -312,7 +314,7 @@ class Translator:
 
     def translate(self, text: str, audio_pcm_b64: str | None = None,
                   audio_rate: int = 16000, source_lang: str | None = None,
-                  pivot_en: str | None = None) -> tuple[str, str]:
+                  pivot_en: str | None = None, context: list[str] | None = None) -> tuple[str, str]:
         # source_lang is the caption's spoken/typed language, if known:
         # None/"auto" means "let the translator detect it" (matches every
         # language this project shipped with before this option existed). A
@@ -332,12 +334,15 @@ class Translator:
             audio = base64.b64decode(audio_pcm_b64, validate=True)
             return asyncio.run(self._translate_live(audio, known_source)), "gemini-live"
         # A phrase heard before (a greeting, "thank you", a repeated line) is answered from memory: no API
-        # call, no quota. Keyed on the exact words, the spoken language and any shared English rendering.
-        cache_key = (known_source, " ".join(text.split()), pivot_en)
+        # call, no quota. Keyed on the exact words, the spoken language, any shared English rendering and the
+        # glossary in force. The preceding sentences are left out on purpose: they only polish a translation,
+        # and keying on them would make every repeated phrase a miss.
+        cache_key = (known_source, " ".join(text.split()), pivot_en, self.glossary.version)
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached, "cache"
-        translated, backend = self._translate_uncached(text, known_source, pivot_en)
+        translated, backend = self._translate_uncached(text, known_source, pivot_en,
+                                                       **({"context": context} if context else {}))
         if backend != "pivot":
             self._cache_put(cache_key, translated)
         return translated, backend
@@ -361,7 +366,8 @@ class Translator:
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
 
-    def _translate_uncached(self, text: str, known_source: str | None, pivot_en: str | None) -> tuple[str, str]:
+    def _translate_uncached(self, text: str, known_source: str | None, pivot_en: str | None,
+                            context: list[str] | None = None) -> tuple[str, str]:
         # LibreTranslate has no Burmese/Khmer/Lao model, so it cannot READ
         # those either: asking it to translate FROM them just failed (after
         # three retries, ~2.4s) before every worker fell back to Gemini.
@@ -375,14 +381,14 @@ class Translator:
                 return pivot_en, "pivot"
             if self._can_use_libretranslate():
                 try:
-                    return self._translate_via_libretranslate(pivot_en, "en"), "libretranslate-pivot"
+                    return self._libretranslate(pivot_en, "en"), "libretranslate-pivot"
                 except Exception as exc:
                     if self.backend_preference == "libretranslate":
                         raise
                     LOG.warning("LibreTranslate pivot call failed (%s); falling back to Gemini", exc)
         elif not source_unreadable and self._can_use_libretranslate():
             try:
-                return self._translate_via_libretranslate(text, known_source), "libretranslate"
+                return self._libretranslate(text, known_source), "libretranslate"
             except Exception as exc:
                 if self.backend_preference == "libretranslate":
                     raise
@@ -397,7 +403,7 @@ class Translator:
                 f"LibreTranslate has no model loaded for {self.lang!r} and "
                 "TRANSLATION_BACKEND=libretranslate forbids falling back to Gemini"
             )
-        return self._translate_text(text, known_source), "gemini-text"
+        return self._translate_text(text, known_source, **({"context": context} if context else {})), "gemini-text"
 
     def _can_use_libretranslate(self) -> bool:
         return (self.backend_preference != "gemini"
@@ -424,6 +430,18 @@ class Translator:
         self._lt_checked_at = now
         return self._lt_supported
 
+    def _libretranslate(self, text: str, source_lang: str | None = None) -> str:
+        """LibreTranslate with the glossary applied: terms become placeholders it leaves alone, and the
+        required renderings go back in afterwards. If it mangles a placeholder, translate plainly instead."""
+        protected, restore = self.glossary.protect(text, self.lang)
+        if protected == text:
+            return self._translate_via_libretranslate(text, source_lang)
+        restored = restore(self._translate_via_libretranslate(protected, source_lang))
+        if restored is None:
+            LOG.info("LibreTranslate changed a glossary placeholder; translating without the glossary")
+            return self._translate_via_libretranslate(text, source_lang)
+        return restored
+
     def _translate_via_libretranslate(self, text: str, source_lang: str | None = None) -> str:
         payload = {"q": text, "source": source_lang or "auto", "target": self.lang, "format": "text"}
         last_exc: Exception | None = None
@@ -440,11 +458,12 @@ class Translator:
                     time.sleep(0.8 * attempt)
         raise last_exc  # type: ignore[misc]
 
-    def _translate_text(self, text: str, source_lang: str | None = None) -> str:
+    def _translate_text(self, text: str, source_lang: str | None = None, context: list[str] | None = None) -> str:
         from google.genai import types  # type: ignore
 
         time.sleep(self.stagger_seconds)
-        instruction = translation_instruction(self.lang, source_lang)
+        instruction = (translation_instruction(self.lang, source_lang) + glossary.context_instruction(context)
+                       + self.glossary.instruction(text, self.lang))
         def request():
             self._await_gemini_slot()
             self.report_status("translating", "Gemini request in progress")
@@ -526,6 +545,8 @@ class TranslatorWorker:
         self._dedupe_lock = threading.Lock()
         self._queued_ids: set[str] = set()
         self._finished: OrderedDict[str, dict] = OrderedDict()
+        self.translated_count = 0
+        self.failed_count = 0
 
     def serve(self) -> None:
         self._start_listener_server()
@@ -603,6 +624,7 @@ class TranslatorWorker:
                 audio_rate=int(message.get("audio_rate", 16000)),
                 source_lang=message.get("source_lang"),
                 pivot_en=message.get("pivot_en"),
+                **({"context": message["context"]} if isinstance(message.get("context"), list) and message["context"] else {}),
             )
             result = {"type": "translated_chunk", "chunk_id": message["chunk_id"], "lang": self.lang,
                       "text": translated, "timestamp": time.time(),
@@ -612,19 +634,28 @@ class TranslatorWorker:
                 while len(self._finished) > 500:
                     self._finished.popitem(last=False)
             self._send_broker(broker, result)
+            self.translated_count += 1
             LOG.info("Translated chunk %s via %s", message["chunk_id"], backend)
         except Exception as exc:
             LOG.error("Translation failed for chunk %s: %s", message.get("chunk_id"), exc)
+            self.failed_count += 1
             try:
                 detail = "Gemini daily quota exhausted" if _is_daily_quota_exhausted(exc) else "Translation failed; inspect worker logs"
                 report("failed", detail)
             except OSError:
                 pass
 
+    def stats(self) -> dict[str, int]:
+        """What this worker has done, sent with every heartbeat so the broker can show it on /metrics."""
+        return {"translated": self.translated_count, "failed": self.failed_count,
+                "cache_hits": int(getattr(self.translator, "cache_hits", 0)),
+                "cache_entries": len(getattr(self.translator, "_cache", {}) or {})}
+
     def _heartbeat_loop(self, broker: socket.socket, stop: threading.Event) -> None:
         while not stop.wait(config.HEARTBEAT_INTERVAL):
             try:
-                self._send_broker(broker, {"type": "heartbeat", "sender_id": self.worker_id, "role": "worker"})
+                self._send_broker(broker, {"type": "heartbeat", "sender_id": self.worker_id, "role": "worker",
+                                           "stats": self.stats()})
             except OSError:
                 try:
                     broker.shutdown(socket.SHUT_RDWR)
@@ -656,9 +687,31 @@ class TranslatorWorker:
                 continue
             except OSError:
                 return
+            if cluster_secret():
+                # With a cluster secret, a caption listener must first prove it knows it (its "subscribe").
+                threading.Thread(target=self._admit_listener, args=(conn, address), daemon=True).start()
+                continue
             with self._listeners_lock:
                 self.listeners.add(conn)
             LOG.info("Listener connected from %s:%s", *address)
+
+    def _admit_listener(self, conn: socket.socket, address) -> None:
+        try:
+            conn.settimeout(3)
+            first = recv_one(conn)
+            conn.settimeout(None)
+            if not authenticate(first) or first.get("type") != "subscribe":
+                raise ProtocolError("missing or wrong cluster secret")
+        except (OSError, ConnectionError, ProtocolError) as exc:
+            LOG.warning("Refused a listener from %s: %s", address[0], exc)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        with self._listeners_lock:
+            self.listeners.add(conn)
+        LOG.info("Listener connected from %s:%s", *address)
 
     def _broadcast(self, message: dict) -> None:
         payload = encode(message)
@@ -683,10 +736,23 @@ class TranslatorWorker:
             listener.close()
 
 
+def advertised_host(host: str) -> str:
+    """The address listeners are told to use. "auto" is this machine's own address on its network (a Docker
+    container's IP), so each copy of a scaled worker advertises itself."""
+    if host != "auto":
+        return host
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return "127.0.0.1"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lang", choices=config.TARGET_LANGUAGES, required=True)
-    parser.add_argument("--host", default=config.DEFAULT_WORKER_HOST)
+    parser.add_argument("--host", default=config.DEFAULT_WORKER_HOST,
+                        help='address listeners use to reach this worker; "auto" advertises the address of the '
+                             'machine it runs on, so a scaled service (docker compose up --scale worker-th=3) needs no fixed name')
     parser.add_argument("--bind-host", default=config.DEFAULT_WORKER_BIND_HOST,
                         help="local interface for listener server; host is the advertised address")
     parser.add_argument("--port", type=int, default=0, help="listener port; 0 chooses a free port")
@@ -696,9 +762,11 @@ def main() -> None:
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    worker = TranslatorWorker(args.lang, args.host, args.port,
+    host = advertised_host(args.host)
+    worker = TranslatorWorker(args.lang, host, args.port,
                               args.worker_id or f"{args.lang}-{uuid.uuid4().hex[:8]}", args.mock,
-                              args.bind_host)
+                              "0.0.0.0" if args.host == "auto" and args.bind_host in (config.DEFAULT_WORKER_HOST, "127.0.0.1", "localhost")
+                              else args.bind_host)
     try:
         worker.serve()
     except KeyboardInterrupt:

@@ -1,0 +1,84 @@
+# Runs on every push and pull request: the unit tests (Python and the browser scripts), the suite inside the
+# Docker test image, and a smoke test of a whole relay started with Docker Compose. No API key is used:
+# the tests are hermetic and the smoke stack uses mock translators.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (Python + JavaScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Light optional dependencies (numpy for the audio paths)
+        run: python -m pip install "numpy<2"
+      - name: Python suite (also runs the JavaScript tests through Node)
+        run: python -m unittest discover -s tests
+      - name: JavaScript tests on their own, for readable output
+        run: node --test tests/js/app.test.js tests/js/speech.test.js tests/js/listen.test.js tests/js/listen_page.test.js
+
+  docker:
+    name: Suite inside the Docker test image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the test image
+        run: docker compose --profile test run --rm --build tests
+
+  smoke:
+    name: Smoke test of a running relay
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Start three brokers, nine mock worker pools and the dashboard
+        run: docker compose -f compose.yaml -f compose.ci.yaml up -d --build --wait
+      - name: Smoke test
+        run: python tools/smoke_test.py --url http://localhost:8000 --wait 90
+      - name: Short load test (all captions must arrive)
+        run: python tools/load_test.py --url http://localhost:8000 --count 30 --rate 2 --rooms 3 --wait 90
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f compose.yaml -f compose.ci.yaml logs --tail 200
+      - name: Stop
+        if: always()
+        run: docker compose -f compose.yaml -f compose.ci.yaml down -v
+
+  chaos:
+    name: Chaos test (kills brokers and workers under load)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Start the relay
+        run: docker compose -f compose.yaml -f compose.ci.yaml up -d --build --wait
+      - name: Chaos test
+        run: python tools/chaos_test.py --duration 90 --rate 1 --every 12 --wait 180 --seed 1
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f compose.yaml -f compose.ci.yaml logs --tail 300
+      - name: Stop
+        if: always()
+        run: docker compose -f compose.yaml -f compose.ci.yaml down -v

@@ -18,6 +18,18 @@ x-common-environment: &common-environment
   POLYGLOT_REPLICATION_INTERVAL: ${POLYGLOT_REPLICATION_INTERVAL:-}
   POLYGLOT_REPLAY_DELAY: ${POLYGLOT_REPLAY_DELAY:-}
   POLYGLOT_TRANSLATION_CACHE: ${POLYGLOT_TRANSLATION_CACHE:-}
+  # A shared secret every broker, worker, dashboard and listener must prove before it is listened to.
+  POLYGLOT_CLUSTER_SECRET: ${POLYGLOT_CLUSTER_SECRET:-}
+  # Leader election: bully (default) or raft (majority votes: never two leaders, needs 2 of 3 brokers up).
+  POLYGLOT_ELECTION: ${POLYGLOT_ELECTION:-}
+  POLYGLOT_RAFT_STATE: ${POLYGLOT_RAFT_STATE:-/data/raft-{id}.json}
+  # Unfinished jobs on each broker's disk, so they survive every broker restarting at once ("" turns it off).
+  POLYGLOT_JOB_JOURNAL: ${POLYGLOT_JOB_JOURNAL-/data/jobs-{id}.db}
+  POLYGLOT_JOB_JOURNAL_MAX_AGE: ${POLYGLOT_JOB_JOURNAL_MAX_AGE:-}
+  # Names and terms rendered the same way everywhere (a JSON file inside the containers; see README).
+  POLYGLOT_GLOSSARY_FILE: ${POLYGLOT_GLOSSARY_FILE:-}
+  # Drop transcripts invented for silence or music ("Thanks for watching!"); 0 turns it off.
+  POLYGLOT_FRAGMENT_GUARD: ${POLYGLOT_FRAGMENT_GUARD:-}
 
 x-app: &app
   image: polyglot-relay:mock
@@ -44,6 +56,7 @@ services:
     # Loopback only: the broker protocol has no authentication. Anyone who can reach it can
     # register as a worker and write captions on every viewer's screen.
     ports: ["127.0.0.1:7001:7001"]
+    volumes: ["broker-data:/data"]          # job journal and election state, one file per broker
     healthcheck:
       test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7001"]
       interval: 2s
@@ -55,6 +68,7 @@ services:
     <<: *app
     command: ["python", "broker.py", "--id", "2"]
     ports: ["127.0.0.1:7002:7002"]
+    volumes: ["broker-data:/data"]          # job journal and election state, one file per broker
     healthcheck:
       test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7002"]
       interval: 2s
@@ -66,6 +80,7 @@ services:
     <<: *app
     command: ["python", "broker.py", "--id", "3"]
     ports: ["127.0.0.1:7003:7003"]
+    volumes: ["broker-data:/data"]          # job journal and election state, one file per broker
     healthcheck:
       test: ["CMD", "python", "-m", "common.healthcheck", "--port", "7003"]
       interval: 2s
@@ -80,52 +95,52 @@ services:
   #   docker compose up --scale worker-th=3
   worker-en-1:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "en", "--mock", "--worker-id", "en-worker-1", "--host", "worker-en-1", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "en", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-en-2:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "en", "--mock", "--worker-id", "en-worker-2", "--host", "worker-en-2", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "en", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-my:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "my", "--mock", "--worker-id", "my-worker-1", "--host", "worker-my", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "my", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-id:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "id", "--mock", "--worker-id", "id-worker-1", "--host", "worker-id", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "id", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-ms:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "ms", "--mock", "--worker-id", "ms-worker-1", "--host", "worker-ms", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "ms", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-th:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "th", "--mock", "--worker-id", "th-worker-1", "--host", "worker-th", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "th", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-vi:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "vi", "--mock", "--worker-id", "vi-worker-1", "--host", "worker-vi", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "vi", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-tl:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "tl", "--mock", "--worker-id", "tl-worker-1", "--host", "worker-tl", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "tl", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-km:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "km", "--mock", "--worker-id", "km-worker-1", "--host", "worker-km", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "km", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   worker-lo:
     <<: *app
-    command: ["python", "translator_worker.py", "--lang", "lo", "--mock", "--worker-id", "lo-worker-1", "--host", "worker-lo", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "lo", "--mock", "--host", "auto", "--port", "8100"]
     depends_on: *worker-dependencies
 
   listener-en:
@@ -177,6 +192,18 @@ services:
       context: .
       target: full
     command: ["python", "web_ui.py", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      <<: *common-environment
+      # Rooms, push updates and translation context (see README).
+      POLYGLOT_MAX_ROOMS: ${POLYGLOT_MAX_ROOMS:-}
+      POLYGLOT_CONTEXT_SENTENCES: ${POLYGLOT_CONTEXT_SENTENCES:-}
+      POLYGLOT_HISTORY_DB_ROWS: ${POLYGLOT_HISTORY_DB_ROWS:-}
+      # Words while the speaker is still talking (costs a transcription every couple of seconds).
+      POLYGLOT_INTERIM: ${POLYGLOT_INTERIM:-}
+      # Read-aloud: clips kept on disk, and the daily allowance per speech model.
+      POLYGLOT_TTS_CACHE_DIR: ${POLYGLOT_TTS_CACHE_DIR:-/data/tts}
+      POLYGLOT_TTS_CACHE_MB: ${POLYGLOT_TTS_CACHE_MB:-}
+      POLYGLOT_TTS_DAILY_LIMIT: ${POLYGLOT_TTS_DAILY_LIMIT:-}
     # Host port 8000, not 8080: 8080 is commonly already bound by other
     # local software (e.g. another web server) on Windows/Docker Desktop
     # hosts. The container's internal port stays 8080.
@@ -245,3 +272,4 @@ networks:
 volumes:
   whisper-cache:
   ui-data:
+  broker-data:

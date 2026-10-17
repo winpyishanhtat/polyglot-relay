@@ -1,0 +1,42 @@
+# Optional layer: Prometheus collects the relay's metrics and Grafana shows them. Add it to any stack:
+#
+#   docker compose -f compose.yaml -f compose.libretranslate.yaml -f compose.monitoring.yaml up -d
+#
+# Grafana: http://localhost:3000 (the "Polyglot Relay" dashboard opens without logging in; viewers only).
+# Prometheus: http://localhost:9090. Both are published on 127.0.0.1 only.
+# The dashboard shows delay from speech to caption per language, captions per minute, queue depth,
+# redeliveries and failovers, load balancing across workers, cache hits, broker leadership and speech usage.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [relay]
+    depends_on: [ui]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # Change it before exposing Grafana anywhere (it is on 127.0.0.1 only by default).
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/polyglot.json
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    networks: [relay]
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

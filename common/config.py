@@ -68,3 +68,10 @@ def language_label(code: str) -> str:
     meta = LANGUAGES[code]
     name, native = meta["name"], meta["native"]
     return name if native == name else f"{name} ({native})"
+
+
+# Leader election: "bully" (default; the highest live broker leads, so even a single survivor carries on) or
+# "raft" (terms and majority votes; never two leaders even when the network splits, but needs a majority up).
+ELECTION_MODE = (os.getenv("POLYGLOT_ELECTION") or "bully").strip().lower()
+if ELECTION_MODE not in ("bully", "raft"):
+    raise ValueError("POLYGLOT_ELECTION must be bully or raft")

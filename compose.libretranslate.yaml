@@ -149,43 +149,43 @@ services:
 
   worker-en-1:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "en", "--worker-id", "en-1-worker-1", "--host", "worker-en-1", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "en", "--host", "auto", "--port", "8100"]
 
   worker-en-2:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "en", "--worker-id", "en-2-worker-1", "--host", "worker-en-2", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "en", "--host", "auto", "--port", "8100"]
 
   worker-my:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "my", "--worker-id", "my-worker-1", "--host", "worker-my", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "my", "--host", "auto", "--port", "8100"]
 
   worker-id:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "id", "--worker-id", "id-worker-1", "--host", "worker-id", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "id", "--host", "auto", "--port", "8100"]
 
   worker-ms:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "ms", "--worker-id", "ms-worker-1", "--host", "worker-ms", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "ms", "--host", "auto", "--port", "8100"]
 
   worker-th:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "th", "--worker-id", "th-worker-1", "--host", "worker-th", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "th", "--host", "auto", "--port", "8100"]
 
   worker-vi:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "vi", "--worker-id", "vi-worker-1", "--host", "worker-vi", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "vi", "--host", "auto", "--port", "8100"]
 
   worker-tl:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "tl", "--worker-id", "tl-worker-1", "--host", "worker-tl", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "tl", "--host", "auto", "--port", "8100"]
 
   worker-km:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "km", "--worker-id", "km-worker-1", "--host", "worker-km", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "km", "--host", "auto", "--port", "8100"]
 
   worker-lo:
     <<: *free-worker
-    command: ["python", "translator_worker.py", "--lang", "lo", "--worker-id", "lo-worker-1", "--host", "worker-lo", "--port", "8100"]
+    command: ["python", "translator_worker.py", "--lang", "lo", "--host", "auto", "--port", "8100"]
 
 volumes:
   lt-models:

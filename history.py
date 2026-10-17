@@ -180,3 +180,136 @@ class HistoryStore:
         if not self._failing and self.log:
             self.log.warning("History file: %s", message)
         self._failing = True
+
+
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+class SqliteHistory:
+    """The caption history on disk (POLYGLOT_HISTORY_FILE), one table for every room.
+
+    Unlike memory, which keeps the newest POLYGLOT_HISTORY_CHUNKS per room, the database keeps up to
+    POLYGLOT_HISTORY_DB_ROWS per room (default 100000), so the History panel can search far back. Writes are
+    upserts keyed by (room, chunk_id). Like the JSON-lines file it replaces, a failing disk never stops
+    captions: the first error is logged and every later call is tried again."""
+
+    PRUNE_EVERY = 200
+
+    def __init__(self, path: str, logger=None, max_rows: int | None = None) -> None:
+        import sqlite3
+        self.path = path
+        self.log = logger
+        self.max_rows = max_rows or max(100, int(os.getenv("POLYGLOT_HISTORY_DB_ROWS") or "100000"))
+        self._lock = threading.Lock()
+        self._failing = False
+        self._saves = 0
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._db = sqlite3.connect(path, check_same_thread=False, timeout=10)
+        with self._db:
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA synchronous=NORMAL")
+            self._db.execute("""CREATE TABLE IF NOT EXISTS captions (
+                room TEXT NOT NULL, chunk_id TEXT NOT NULL, number INTEGER, created_at REAL NOT NULL,
+                text TEXT, source_lang TEXT, translations TEXT NOT NULL, PRIMARY KEY (room, chunk_id))""")
+            self._db.execute("CREATE INDEX IF NOT EXISTS captions_by_time ON captions (room, created_at)")
+
+    @staticmethod
+    def _row(record) -> dict:
+        chunk_id, number, created_at, text, source_lang, translations = record
+        return {"chunk_id": chunk_id, "number": number, "created_at": created_at, "text": text,
+                "source_lang": source_lang, "translations": json.loads(translations)}
+
+    def _run(self, action: str, function, default):
+        with self._lock:
+            try:
+                result = function()
+                self._failing = False
+                return result
+            except Exception as exc:  # noqa: BLE001 - a broken disk must never stop captions
+                if not self._failing and self.log:
+                    self.log.warning("History database: cannot %s %s: %s", action, self.path, exc)
+                self._failing = True
+                return default
+
+    def save(self, room: str, row: dict) -> None:
+        def write():
+            with self._db:
+                self._db.execute(
+                    "INSERT INTO captions VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (room, chunk_id) DO UPDATE SET "
+                    "number=excluded.number, created_at=excluded.created_at, text=excluded.text, "
+                    "source_lang=excluded.source_lang, translations=excluded.translations",
+                    (room, row["chunk_id"], row.get("number"), float(row["created_at"]), row.get("text"),
+                     row.get("source_lang"), json.dumps(row.get("translations") or {}, ensure_ascii=False)))
+            self._saves += 1
+            if self._saves % self.PRUNE_EVERY == 0:
+                self._prune(room)
+        self._run("write", write, None)
+
+    def _prune(self, room: str) -> None:
+        with self._db:
+            self._db.execute("""DELETE FROM captions WHERE room = ? AND chunk_id NOT IN (
+                SELECT chunk_id FROM captions WHERE room = ? ORDER BY created_at DESC LIMIT ?)""", (room, room, self.max_rows))
+
+    def load(self, room: str, limit: int) -> "OrderedDict[str, dict]":
+        def read():
+            records = self._db.execute(
+                "SELECT chunk_id, number, created_at, text, source_lang, translations FROM captions WHERE room = ? "
+                "ORDER BY created_at DESC, number DESC LIMIT ?", (room, limit)).fetchall()
+            return OrderedDict((r["chunk_id"], r) for r in map(self._row, reversed(records)))
+        return self._run("read", read, OrderedDict())
+
+    def query(self, room: str, since: float | None, until: float | None) -> list[dict]:
+        """Every row of a room in a time window, oldest first (filtering by language and text is the caller's)."""
+        def read():
+            sql = ("SELECT chunk_id, number, created_at, text, source_lang, translations FROM captions "
+                   "WHERE room = ? AND created_at >= ? AND created_at <= ? ORDER BY created_at, number")
+            low = float("-inf") if since is None else since
+            high = float("inf") if until is None else until
+            return [self._row(r) for r in self._db.execute(sql, (room, low, high))]
+        return self._run("read", read, [])
+
+    def count(self, room: str) -> int:
+        return self._run("read", lambda: self._db.execute("SELECT COUNT(*) FROM captions WHERE room = ?", (room,)).fetchone()[0], 0)
+
+    def rooms(self) -> list[str]:
+        return self._run("read", lambda: [r[0] for r in self._db.execute("SELECT DISTINCT room FROM captions ORDER BY room")], [])
+
+    def wipe(self, room: str) -> None:
+        def clear():
+            with self._db:
+                self._db.execute("DELETE FROM captions WHERE room = ?", (room,))
+        self._run("clear", clear, None)
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+
+def open_history(path: str, logger=None, default_room: str = "main") -> SqliteHistory:
+    """Open the history database at `path`. A JSON-lines history left by an earlier version - at `path` itself,
+    or beside a new database as <name>.jsonl - is imported into `default_room` and kept as a .bak file."""
+    legacy = None
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(len(SQLITE_MAGIC))
+        if head and head != SQLITE_MAGIC:
+            legacy = HistoryStore(path, 10 ** 9, logger).load()
+            backup = path + ".jsonl.bak"
+            os.replace(path, backup)
+            if logger:
+                logger.info("Moving %d captions from the old history file to SQLite (old file kept as %s)", len(legacy), backup)
+    except FileNotFoundError:
+        # A new database next to the JSON-lines file of an earlier version (history.db beside history.jsonl):
+        # bring that history along, once.
+        sibling = os.path.splitext(path)[0] + ".jsonl"
+        if sibling != path and os.path.exists(sibling):
+            legacy = HistoryStore(sibling, 10 ** 9, logger).load()
+            os.replace(sibling, sibling + ".bak")
+            if logger:
+                logger.info("Moving %d captions from %s to %s (old file kept as %s.bak)", len(legacy), sibling, path, sibling)
+    store = SqliteHistory(path, logger)
+    for row in (legacy or {}).values():
+        store.save(default_room, row)
+    return store

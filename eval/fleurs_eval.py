@@ -182,32 +182,53 @@ def summarize_asr(results: list[dict]) -> dict:
     return summary
 
 
-def default_translator(target: str = "en") -> Callable[[str, str], str]:
+def default_translator(target: str = "en") -> Callable[..., str]:
     from translator_worker import Translator
     translator = Translator(target)
 
-    def translate(text: str, source_lang: str) -> str:
-        return translator.translate(text, source_lang=source_lang)[0]
+    def translate(text: str, source_lang: str, context: list[str] | None = None) -> str:
+        return translator.translate(text, source_lang=source_lang, **({"context": context} if context else {}))[0]
     return translate
 
 
-def run_mt(items: list[dict], translate: Callable[[str, str], str],
-           hypotheses: dict[str, str] | None = None) -> list[dict]:
+def _sentence_order(item: dict) -> tuple:
+    """FLEURS sentences of one article have consecutive sentence ids; ordering by id approximates the order
+    they were said in, which is what translation context needs."""
+    try:
+        return (item["lang"], int(item.get("sentence_id") or 0))
+    except (TypeError, ValueError):
+        return (item["lang"], 0)
+
+
+def run_mt(items: list[dict], translate: Callable[..., str],
+           hypotheses: dict[str, str] | None = None, context: int = 0) -> list[dict]:
     """Translate into English. hypotheses (id -> ASR text) switches to end-to-end scoring;
-    a clip with no ASR text is translated from the empty string, i.e. scores as a failure."""
+    a clip with no ASR text is translated from the empty string, i.e. scores as a failure.
+    context > 0 gives the translator that many preceding sentences of the same language (in sentence-id
+    order, as the relay does with what was said before), for an A/B comparison with eval/compare_mt.py."""
     results = []
-    for item in items:
+    ordered = sorted(items, key=_sentence_order) if context else items
+    previous: dict[str, list[str]] = {}
+    for item in ordered:
         if not item.get("english"):
             continue
         source_text = item["transcript"] if hypotheses is None else hypotheses.get(item["id"], "")
         error = None
+        earlier = previous.setdefault(item["lang"], [])
         try:
-            output = translate(source_text, item["lang"]) if source_text.strip() else ""
+            if not source_text.strip():
+                output = ""
+            elif context:
+                output = translate(source_text, item["lang"], earlier[-context:] or None)
+            else:
+                output = translate(source_text, item["lang"])
         except Exception as exc:
             output, error = "", f"{type(exc).__name__}: {exc}"
         results.append({"id": item["id"], "lang": item["lang"], "source": source_text, "output": output,
                         "reference": item["english"], "stats": metrics.chrf_stats(item["english"], output),
                         "error": error})
+        if source_text.strip():
+            earlier.append(source_text)
     return results
 
 
@@ -262,7 +283,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="default: the relay's own choice; gemini: Gemini only, no fallback; "
                              "whisper: Whisper for every language it can read (asr only)")
     parser.add_argument("--from-asr", type=pathlib.Path, help="mt only: translate this asr run's output")
+    parser.add_argument("--context", type=int, default=0,
+                        help="mt only: give the translator this many preceding sentences (the relay's default is 2)")
+    parser.add_argument("--glossary", type=pathlib.Path, help="mt only: use this glossary file (POLYGLOT_GLOSSARY_FILE)")
     args = parser.parse_args(argv)
+    if args.glossary:
+        import os
+        os.environ["POLYGLOT_GLOSSARY_FILE"] = str(args.glossary)
 
     items = load_manifest(args.manifest, args.langs, args.limit)
     if args.mode == "asr":
@@ -273,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         hypotheses = None
         if args.from_asr:
             hypotheses = {r["id"]: r["hypothesis"] for r in json.loads(args.from_asr.read_text(encoding="utf-8"))["results"]}
-        results = run_mt(items, default_translator("en"), hypotheses)
+        results = run_mt(items, default_translator("en"), hypotheses, context=max(0, args.context))
         summary = summarize_mt(results)
         table = markdown_table(summary, MT_COLUMNS)
     args.out.parent.mkdir(parents=True, exist_ok=True)

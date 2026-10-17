@@ -25,6 +25,20 @@ function run(segments, options) {
   }
   return cuts;
 }
+// Like run, but each segment also gives the share of energy in the voice band (the page measures it).
+function runVoiced(segments, options) {
+  const slicer = new LiveSlicer(options);
+  const cuts = [];
+  let now = 0;
+  for (const [seconds, level, wobble, ratio] of segments) {
+    for (let i = 0; i < Math.round(seconds * 20); i++) {
+      now += 50;
+      const d = slicer.push(Math.max(0, level + (wobble || 0) * jitter()), now, ratio);
+      if (d.cut) cuts.push({ at: now / 1000, reason: d.reason, hadSpeech: d.hadSpeech });
+    }
+  }
+  return cuts;
+}
 const SPEECH = 0.2, QUIET = 0.002;
 console.log(JSON.stringify({
   phrase_then_pause: run([[3, SPEECH, 0.1], [1, QUIET]]),
@@ -37,6 +51,11 @@ console.log(JSON.stringify({
   quiet_speaker_from_the_first_moment: run([[3, 0.02, 0.006], [6, 0.001]]),
   loud_continuous_talker_in_loud_room: run([[8.5, 0.2, 0.02]]),
   custom_limits: run([[10, SPEECH, 0.1]], { maxMs: 4000 }),
+  clicks_in_silence: run(Array.from({ length: 10 }, () => [[0.05, 0.5], [0.95, QUIET]]).flat()),
+  soft_word_ending_in_a_noisy_room: run([[3, 0.02, 0.004], [2, SPEECH, 0.05], [0.4, 0.045], [1, 0.02, 0.004]]),
+  soft_word_ending_without_hysteresis: run([[3, 0.02, 0.004], [2, SPEECH, 0.05], [0.4, 0.045], [1, 0.02, 0.004]], { holdRatio: 1 }),
+  loud_hum: runVoiced([[10, 0.2, 0.02, 0.1]]),
+  voice_over_hum: runVoiced([[1, 0.2, 0.02, 0.1], [2, 0.3, 0.05, 0.8], [1, 0.2, 0.02, 0.1]]),
 }));
 """
 
@@ -108,6 +127,30 @@ class LiveSlicerTests(unittest.TestCase):
 
     def test_limits_are_configurable(self):
         self.assertEqual([round(c["at"]) for c in self.out["custom_limits"]], [4, 8])
+
+
+    def test_clicks_in_a_silent_room_do_not_make_a_slice_worth_sending(self):
+        cuts = self.out["clicks_in_silence"]
+        self.assertTrue(cuts)
+        self.assertFalse(any(c["hadSpeech"] for c in cuts))
+
+    def test_a_soft_word_ending_is_not_taken_for_the_pause(self):
+        # Speech ends at 5.0 s; its soft tail lasts to 5.4 s. With hysteresis the phrase is cut after the tail.
+        (with_hold,) = self.out["soft_word_ending_in_a_noisy_room"]
+        (without,) = self.out["soft_word_ending_without_hysteresis"]
+        self.assertAlmostEqual(with_hold["at"], 5.75, delta=0.2)
+        self.assertLess(without["at"], with_hold["at"])                 # cut inside the tail, clipping the word
+
+    def test_a_loud_hum_is_not_a_voice(self):
+        cuts = self.out["loud_hum"]
+        self.assertEqual([c["reason"] for c in cuts], ["max"])
+        self.assertFalse(cuts[0]["hadSpeech"])
+
+    def test_a_voice_over_a_hum_is_heard_and_cut_at_its_end(self):
+        (cut,) = self.out["voice_over_hum"]
+        self.assertTrue(cut["hadSpeech"])
+        self.assertEqual(cut["reason"], "pause")
+        self.assertAlmostEqual(cut["at"], 3.4, delta=0.2)
 
 
 class LiveSlicerWiringTests(unittest.TestCase):

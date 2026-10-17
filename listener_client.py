@@ -11,7 +11,7 @@ import time
 from common import config
 from common import netutil
 from common.discovery import discover_worker
-from common.protocol import ProtocolError, decode_stream
+from common.protocol import ProtocolError, cluster_secret, decode_stream, encode
 
 LOG = logging.getLogger("polyglot.listener")
 
@@ -26,6 +26,8 @@ def listen(lang: str) -> None:
         try:
             with netutil.connect(worker["host"], worker["port"], config.CONNECT_TIMEOUT) as sock:
                 sock.settimeout(None)
+                if cluster_secret():              # a worker with a cluster secret wants proof first
+                    sock.sendall(encode({"type": "subscribe", "lang": lang, "sender_id": "console"}))
                 LOG.info("Connected to worker %s", worker["worker_id"])
                 for message in decode_stream(sock):
                     if message["type"] == "translated_chunk":

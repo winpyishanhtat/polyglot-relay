@@ -6,7 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
-RUN groupadd --system polyglot && useradd --system --gid polyglot --create-home polyglot
+RUN groupadd --system polyglot && useradd --system --gid polyglot --create-home polyglot \
+    && mkdir -p /data && chown polyglot:polyglot /data
+# /data is where named volumes keep state: broker job journals and election state, the dashboard's history
+# and speech clips. Created here, owned by polyglot, so an empty volume mounted on it is writable.
 
 # Fast image for architecture testing. The socket-based core uses only stdlib.
 FROM base AS mock

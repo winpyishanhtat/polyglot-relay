@@ -1,0 +1,25 @@
+{
+  "sentences_checked": 3597,
+  "by_language": {
+    "en": 450,
+    "my": 300,
+    "id": 450,
+    "ms": 449,
+    "th": 449,
+    "vi": 449,
+    "tl": 450,
+    "km": 300,
+    "lo": 300
+  },
+  "by_source": {
+    "reference": 1350,
+    "transcript:gemini": 898,
+    "transcript:whisper-or-routed": 1349
+  },
+  "real_speech_dropped_if_loud": 0,
+  "real_speech_dropped_if_quiet": 0,
+  "dropped_examples": [],
+  "known_fragments": 22,
+  "known_fragments_caught": 22,
+  "missed_fragments": []
+}

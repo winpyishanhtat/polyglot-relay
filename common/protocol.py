@@ -1,9 +1,23 @@
-"""Newline-delimited JSON wire protocol."""
+"""Newline-delimited JSON wire protocol.
+
+With POLYGLOT_CLUSTER_SECRET set, every message carries an "auth" proof: an HMAC-SHA256 over a timestamp, a
+one-time nonce and the message type, keyed with the shared secret (the secret itself is never sent). Whoever
+accepts a connection checks the first message with authenticate(): a missing, wrong, stale or replayed proof
+is refused, so a process that does not know the secret cannot register as a worker, inject captions or take
+part in elections. Without the secret nothing changes.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
+import secrets
 import socket
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from typing import Any
 
@@ -12,7 +26,58 @@ MESSAGE_TYPES = {
     "register", "register_ack", "transcript_chunk", "translated_chunk",
     "heartbeat", "heartbeat_ack", "election", "election_ok",
     "leader_announce", "discover_worker", "worker_info", "error", "chunk_status", "replicate_batch", "chunk_ack",
+    "subscribe", "vote_request", "vote_reply", "leader_heartbeat",
 }
+
+AUTH_WINDOW_SECONDS = 120          # a proof older or newer than this is refused (clocks may differ a little)
+_SEEN_LIMIT = 20000
+
+
+def cluster_secret() -> str:
+    """Read each time, so it can be set or changed without reloading this module."""
+    return os.getenv("POLYGLOT_CLUSTER_SECRET") or ""
+
+
+def _mac(secret: str, stamp: int, nonce: str, kind: str) -> str:
+    return hmac.new(secret.encode("utf-8"), f"{stamp}:{nonce}:{kind}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def sign(msg: dict[str, Any], secret: str | None = None) -> dict[str, Any]:
+    secret = cluster_secret() if secret is None else secret
+    if not secret:
+        return msg
+    stamp, nonce = int(time.time()), secrets.token_hex(8)
+    return {**msg, "auth": {"ts": stamp, "nonce": nonce, "mac": _mac(secret, stamp, nonce, str(msg.get("type")))}}
+
+
+_seen: OrderedDict[str, float] = OrderedDict()
+_seen_lock = threading.Lock()
+
+
+def authenticate(msg: dict[str, Any], secret: str | None = None, now: float | None = None) -> bool:
+    """True when no secret is configured, or `msg` carries a valid proof that has not been used before."""
+    secret = cluster_secret() if secret is None else secret
+    if not secret:
+        return True
+    proof = msg.get("auth")
+    if not isinstance(proof, dict):
+        return False
+    try:
+        stamp, nonce, mac = int(proof["ts"]), str(proof["nonce"]), str(proof["mac"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    now = time.time() if now is None else now
+    if abs(now - stamp) > AUTH_WINDOW_SECONDS or not nonce:
+        return False
+    if not hmac.compare_digest(mac, _mac(secret, stamp, nonce, str(msg.get("type")))):
+        return False
+    with _seen_lock:
+        while _seen and (len(_seen) > _SEEN_LIMIT or next(iter(_seen.values())) < now - 2 * AUTH_WINDOW_SECONDS):
+            _seen.popitem(last=False)
+        if nonce in _seen:
+            return False                    # a recording of an earlier message, played back
+        _seen[nonce] = now
+    return True
 
 
 class ProtocolError(ValueError):
@@ -25,7 +90,7 @@ def encode(msg: dict[str, Any]) -> bytes:
         raise ProtocolError("message must be a dict containing a string 'type'")
     if msg["type"] not in MESSAGE_TYPES:
         raise ProtocolError(f"unknown message type: {msg['type']}")
-    return (json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    return (json.dumps(sign(msg), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 def decode_stream(sock: socket.socket) -> Iterator[dict[str, Any]]:

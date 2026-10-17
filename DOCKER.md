@@ -93,10 +93,12 @@ dict) — the dashboard at http://localhost:8000 shows all of them at once.
 ## 5. Verify English round-robin routing
 
 ```powershell
-docker compose logs --since 2m broker-1 broker-2 | Select-String "Forwarded chunk.*to en worker"
+docker compose logs --since 2m broker-1 broker-2 broker-3 | Select-String "Forwarded chunk.*to en worker"
 ```
 
-The worker IDs should alternate between `en-worker-1` and `en-worker-2`.
+The chunks should alternate between the two English workers (each picks its own id, such as `en-3f9a1c2b`;
+the leader gives each job to the one with the fewest unfinished jobs). Any pool can be scaled the same way:
+`docker compose up -d --scale worker-th=3`, or automatically with `tools/autoscale.py` (see README).
 
 ## 6. Test a pooled worker failure
 

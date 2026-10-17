@@ -3,6 +3,7 @@
 // /listen shows all of them; /listen/th starts with just that one (more can be added); ?langs=th,my,km picks.
 (function (root) {
   const POLL_MS = 1000;
+  const STREAM_POLL_MS = 10000;    // with pushed captions, polling is only a safety net
   const WINDOW_MINUTES = 30;
   const EARLIER_SHOWN = 10;
   const MAX_QUEUED_SPEECH = 2;     // a caption read late is worse than one skipped
@@ -78,6 +79,10 @@
     accessToken = new URLSearchParams(window.location.search).get("token") || sessionStorage.getItem("polyglot-token") || "";
     if (accessToken) sessionStorage.setItem("polyglot-token", accessToken);
   } catch (_) { /* no storage here: stay open */ }
+  // The room this page follows: ?room=hall-a, or the default room.
+  let room = "main";
+  try { room = (new URLSearchParams(window.location.search).get("room") || "main").toLowerCase(); } catch (_) { /* default */ }
+  const roomQuery = room === "main" ? "" : `&room=${encodeURIComponent(room)}`;
   function stored(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
   function store(key, value) { try { localStorage.setItem(key, value); } catch (_) { /* optional */ } }
 
@@ -107,16 +112,67 @@
     let generation = 0;
 
     $("listen-view").hidden = false;
-    document.title = "Live captions — Polyglot Relay";
+    document.title = room === "main" ? "Live captions — Polyglot Relay" : `Live captions · ${room} — Polyglot Relay`;
+    const roomLabel = $("listen-room");
+    if (roomLabel) { roomLabel.textContent = room === "main" ? "" : `Room ${room}`; roomLabel.hidden = room === "main"; }
 
+    // The relay's voices and today's speech allowance; the page warns before relay-voice clips run out.
+    let relayVoices = [];
+    let quotaLeft = null;
+    let warnWhenLeft = 3;
     const speaker = root.PolyglotSpeech.createSpeaker({
       speechSynthesis: window.speechSynthesis, SpeechSynthesisUtterance: window.SpeechSynthesisUtterance,
       fetch: window.fetch.bind(window), Audio: window.Audio, URL: window.URL,
       headers: () => ({ "Content-Type": "application/json", ...(accessToken ? { "X-Access-Token": accessToken } : {}) }),
+      onQuota: (left) => { quotaLeft = left; describeReading(); },
     });
     const note = $("listen-note");
     const button = $("listen-speak");
     const readSelect = $("listen-read-lang");
+    const voiceSelect = $("listen-voice");
+    try {
+      const info = await (await fetch("/api/tts/info")).json();
+      relayVoices = Array.isArray(info.voices) ? info.voices : [];
+      quotaLeft = info.quota && typeof info.quota.left === "number" ? info.quota.left : null;
+      warnWhenLeft = info.warn_when_left || warnWhenLeft;
+    } catch (_) { /* speech details are optional */ }
+
+    // A voice choice per language, remembered: "" (best available), "b:<device voice>" or "r:<relay voice>".
+    function voiceChoice(lang) {
+      const saved = stored(`polyglot-voice-${lang}`) || "";
+      if (saved.startsWith("b:")) return { browser: saved.slice(2) };
+      if (saved.startsWith("r:")) return { relay: saved.slice(2) };
+      return undefined;
+    }
+    function usesRelay(lang) {
+      const choice = voiceChoice(lang);
+      return Boolean(choice && choice.relay) || !speaker.hasBrowserVoice(lang);
+    }
+    function drawVoices() {
+      if (!voiceSelect) return;
+      const automatic = element("option", "", "Voice: automatic");
+      automatic.value = "";
+      const device = (speaker.browserVoiceNames ? speaker.browserVoiceNames(readLang) : []).map((name) => {
+        const option = element("option", "", `Device: ${name}`);
+        option.value = `b:${name}`;
+        return option;
+      });
+      const relay = relayVoices.map((name) => {
+        const option = element("option", "", `Relay: ${name}`);
+        option.value = `r:${name}`;
+        return option;
+      });
+      voiceSelect.replaceChildren(automatic, ...device, ...relay);
+      voiceSelect.value = stored(`polyglot-voice-${readLang}`) || "";
+      voiceSelect.hidden = !reading;
+    }
+    if (voiceSelect) {
+      voiceSelect.addEventListener("change", () => {
+        store(`polyglot-voice-${readLang}`, voiceSelect.value);
+        speaker.stop();
+        describeReading();
+      });
+    }
 
     function applySize() {
       document.documentElement.style.setProperty("--listen-size", `${size}px`);
@@ -150,7 +206,7 @@
 
     function changeLanguages(next) {
       langs = next;
-      if (!langs.includes(readLang)) { readLang = langs[0]; speaker.stop(); }
+      if (!langs.includes(readLang)) { readLang = langs[0]; speaker.stop(); drawVoices(); }
       store("polyglot-listen-langs", langs.join(","));
       chunks = new Map();            // refetched below with the new choice
       first = true;
@@ -163,12 +219,19 @@
       poll();
     }
 
-    readSelect.addEventListener("change", () => { readLang = readSelect.value; speaker.stop(); describeReading(); });
+    readSelect.addEventListener("change", () => { readLang = readSelect.value; speaker.stop(); drawVoices(); describeReading(); });
     function describeReading() {
       if (!reading) { note.textContent = ""; return; }
-      note.textContent = speaker.hasBrowserVoice(readLang)
-        ? `New ${byCode[readLang].name} captions will be read aloud with your device's voice.`
-        : `Your device has no ${byCode[readLang].name} voice, so the relay's voice is used.`;
+      const choice = voiceChoice(readLang);
+      let text;
+      if (choice && choice.relay) text = `New ${byCode[readLang].name} captions will be read aloud with the relay's ${choice.relay} voice.`;
+      else if (speaker.hasBrowserVoice(readLang)) text = `New ${byCode[readLang].name} captions will be read aloud with your device's voice.`;
+      else text = `Your device has no ${byCode[readLang].name} voice, so the relay's voice is used.`;
+      if (usesRelay(readLang) && quotaLeft !== null) {
+        if (quotaLeft <= 0) text += " The relay's speech allowance for today is used up, so captions cannot be read aloud until it resets.";
+        else if (quotaLeft <= warnWhenLeft) text += ` Only ${quotaLeft} relay-voice clip${quotaLeft === 1 ? "" : "s"} left today.`;
+      }
+      note.textContent = text;
     }
     button.addEventListener("click", () => {
       reading = !reading;
@@ -176,6 +239,7 @@
       button.textContent = reading ? "Stop reading" : "Read aloud";
       readSelect.hidden = !reading;
       if (!reading) speaker.stop();
+      drawVoices();
       describeReading();
       // Browsers only allow speech after a tap: speak an empty utterance on the same gesture.
       if (reading && window.speechSynthesis && window.SpeechSynthesisUtterance) {
@@ -209,23 +273,60 @@
       $("listen-earlier").replaceChildren(...rest.map((chunk) => sentence(chunk, false)));
     }
 
+    // New captions, from a poll or pushed by the server: show them, and read the new ones aloud.
+    function absorb(rows, speak) {
+      const arrivals = mergeChunks(chunks, rows, langs);
+      if (arrivals.length) render();
+      if (reading && speak) {
+        for (const entry of toSpeak(arrivals, readLang)) {
+          speaker.speak(entry.text, readLang, voiceChoice(readLang)).catch((error) => {
+            if (error.message !== "stopped") note.textContent = error.message;
+          });
+        }
+      }
+      return arrivals;
+    }
+
+    // Pushed captions (Server-Sent Events) arrive the moment a worker answers; polling then only fills gaps.
+    let streamOpen = false;
+    function openStream() {
+      if (typeof root.EventSource === "undefined") return;
+      const stream = new root.EventSource(`/api/events?x=1${roomQuery}`);
+      stream.onopen = () => { streamOpen = true; setState(true, "Live"); };
+      stream.onerror = () => { streamOpen = false; };
+      stream.addEventListener("caption", (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (!first) absorb([data.row], true);
+        } catch (_) { /* a malformed event is ignored; the next poll catches up */ }
+      });
+      stream.addEventListener("clear", () => {
+        chunks = new Map();
+        $("listen-latest").replaceChildren(element("p", "empty", "Waiting for the first caption…"));
+        $("listen-earlier").replaceChildren();
+        $("listen-earlier-heading").hidden = true;
+      });
+      stream.addEventListener("reload", () => { poll(); });
+      // Words still being spoken (POLYGLOT_INTERIM): shown under the newest sentence until it is finished.
+      stream.addEventListener("interim", (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          const box = $("listen-interim");
+          if (box && data.text) { box.textContent = `\u2026 ${data.text}`; box.hidden = false; }
+        } catch (_) { /* ignore */ }
+      });
+      stream.addEventListener("chunk", () => { const box = $("listen-interim"); if (box) { box.textContent = ""; box.hidden = true; } });
+    }
+
     async function poll() {
       const mine = generation;
       try {
-        const query = `/api/history?langs=${encodeURIComponent(langs.join(","))}&last_minutes=${WINDOW_MINUTES}&limit=80`;
+        const query = `/api/history?langs=${encodeURIComponent(langs.join(","))}&last_minutes=${WINDOW_MINUTES}&limit=80${roomQuery}`;
         const reply = await fetch(query);
         if (reply.status === 401) { setState(false, "Needs the link with its token"); return; }
         const data = await reply.json();
         if (mine !== generation) return;           // the choice changed while this was in flight
-        const arrivals = mergeChunks(chunks, data.chunks, langs);
-        if (arrivals.length) render();
-        if (reading && !first) {
-          for (const entry of toSpeak(arrivals, readLang)) {
-            speaker.speak(entry.text, readLang).catch((error) => {
-              if (error.message !== "stopped") note.textContent = error.message;
-            });
-          }
-        }
+        absorb(data.chunks, !first);
         first = false;
         setState(true, "Live");
       } catch (_) {
@@ -234,7 +335,8 @@
     }
 
     drawChips();
-    (async function loop() { await poll(); setTimeout(loop, POLL_MS); })();
+    openStream();
+    (async function loop() { await poll(); setTimeout(loop, streamOpen ? STREAM_POLL_MS : POLL_MS); })();
   }
 
   start().catch(() => setState(false, "Could not load"));

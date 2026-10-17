@@ -1,0 +1,14 @@
+# Scrapes the dashboard's /metrics, which also reports the brokers, the leader's job counters and every worker.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: polyglot-relay
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ui:8080"]
+    # With POLYGLOT_VIEW_TOKEN set, put the token in monitoring/view-token (one line, kept out of git) and
+    # uncomment these two lines:
+    # authorization:
+    #   credentials_file: /etc/prometheus/view-token

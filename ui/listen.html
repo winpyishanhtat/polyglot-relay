@@ -27,11 +27,15 @@
 
       <section id="listen-view" hidden>
         <div class="listen-head">
-          <h1>Live captions</h1>
+          <div>
+            <h1>Live captions</h1>
+            <span id="listen-room" class="listen-room" hidden></span>
+          </div>
           <div class="listen-tools">
             <button type="button" class="button secondary" id="listen-smaller" aria-label="Smaller text">A−</button>
             <button type="button" class="button secondary" id="listen-larger" aria-label="Larger text">A+</button>
             <select id="listen-read-lang" aria-label="Language to read aloud" hidden></select>
+            <select id="listen-voice" aria-label="Voice" hidden></select>
             <button type="button" class="button primary" id="listen-speak" aria-pressed="false">Read aloud</button>
           </div>
         </div>
@@ -41,6 +45,7 @@
         </div>
         <p id="listen-note" class="listen-note" role="status"></p>
         <div id="listen-latest" class="listen-latest" role="log" aria-live="polite"><p class="empty">Waiting for the first caption…</p></div>
+        <p id="listen-interim" class="listen-interim" hidden></p>
         <h2 id="listen-earlier-heading" class="listen-earlier-heading" hidden>Earlier</h2>
         <div id="listen-earlier" class="listen-earlier"></div>
       </section>

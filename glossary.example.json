@@ -1,0 +1,10 @@
+{
+  "UIT": "*",
+  "University of Information Technology": "*",
+  "Polyglot Relay": "*",
+  "Win Pyi Shan Htat": "*",
+  "Ho Chi Minh City": {"vi": "Thành phố Hồ Chí Minh"},
+  "broker": {"vi": "broker", "id": "broker", "ms": "broker", "tl": "broker"},
+  "Raft": "*",
+  "Gemini": "*"
+}

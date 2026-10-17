@@ -349,3 +349,12 @@ a.text-button { text-decoration: none; }
   .listen-chunk .listen-original { grid-column: 1 / -1; }
 }
 @media (max-width: 600px) { .listen-line { grid-template-columns: 30px 1fr; gap: 8px; } .listen-chunk { padding: 14px; } }
+
+/* ---- rooms ------------------------------------------------------------------ */
+.room-form { display: inline-flex; align-items: center; gap: 6px; }
+.room-form label { color: var(--muted); font: 600 10.5px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+.room-form input { width: 9.5em; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: #fffcf5; color: var(--paper); font: 500 13px/1.2 var(--font-mono); }
+@media (max-width: 600px) { .room-form label { display: none; } .room-form input { width: 7em; } }
+.listen-room { display: inline-block; margin-top: 6px; color: var(--muted); font: 600 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .08em; }
+.live-interim { margin: 10px 0 0; padding: 10px 12px; border-left: 3px solid var(--sage); background: #fffcf5; color: var(--muted); font-style: italic; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+.listen-interim { margin: 0; padding: 12px 22px 18px; color: var(--muted); font-style: italic; font-size: calc(var(--listen-size) * .6); overflow-wrap: anywhere; }

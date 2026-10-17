@@ -47,7 +47,7 @@ const LANGUAGES = [
   ["th", "Thai", "ASEAN"], ["vi", "Vietnamese", "ASEAN"], ["tl", "Filipino", "ASEAN"], ["km", "Khmer", "ASEAN"], ["lo", "Lao", "ASEAN"],
 ].map(([code, name, group]) => ({ code, name, native: name.toLowerCase(), group }));
 
-const IDS = ["listen-view", "listen-fallback", "listen-note", "listen-speak", "listen-read-lang", "listen-chips",
+const IDS = ["listen-view", "listen-fallback", "listen-note", "listen-speak", "listen-read-lang", "listen-voice", "listen-interim", "listen-chips",
   "listen-latest", "listen-earlier", "listen-earlier-heading", "listen-smaller", "listen-larger"];
 
 const row = (id, number, translations = {}, extra = {}) => ({
@@ -59,8 +59,9 @@ const row = (id, number, translations = {}, extra = {}) => ({
 const flush = async () => { for (let i = 0; i < 30; i++) await new Promise((resolve) => setImmediate(resolve)); };
 
 // `history` is a function (url) => {status?, body?} | throws; it decides what each poll receives.
-async function openPage({ search = "", pathname = "/listen", history = () => ({ body: { chunks: [] } }), stored = {}, hasVoice = true } = {}) {
-  const els = Object.fromEntries(IDS.map((id) => [id, new FakeElement(id === "listen-read-lang" ? "select" : "div")]));
+async function openPage({ search = "", pathname = "/listen", history = () => ({ body: { chunks: [] } }), stored = {}, hasVoice = true, streaming = false,
+                         ttsInfo = { voices: ["Kore", "Puck"], quota: { left: null }, warn_when_left: 3 }, deviceVoices = ["Device A"] } = {}) {
+  const els = Object.fromEntries(IDS.map((id) => [id, new FakeElement(id === "listen-read-lang" || id === "listen-voice" ? "select" : "div")]));
   els["listen-fallback"].hidden = false;
   els["listen-view"].hidden = true;
   els["listen-earlier-heading"].hidden = true;
@@ -71,8 +72,17 @@ async function openPage({ search = "", pathname = "/listen", history = () => ({ 
 
   const fetchLog = [];
   const timers = [];
+  const delays = [];
+  const streams = [];
+  // A stand-in for the browser's EventSource: tests open it, then push events through `emit`.
+  class FakeEventSource {
+    constructor(url) { this.url = url; this.listeners = {}; streams.push(this); }
+    addEventListener(kind, handler) { (this.listeners[kind] ||= []).push(handler); }
+    emit(kind, data) { for (const handler of this.listeners[kind] || []) handler({ data: JSON.stringify(data) }); }
+    emitRaw(kind, raw) { for (const handler of this.listeners[kind] || []) handler({ data: raw }); }
+  }
   const spoken = [];
-  const speakerLog = { stops: 0, speakFails: null };
+  const speakerLog = { stops: 0, speakFails: null, choices: [], onQuota: null };
   const storage = new Map(Object.entries(stored));
   const cssVars = {};
   const sandbox = {
@@ -87,28 +97,32 @@ async function openPage({ search = "", pathname = "/listen", history = () => ({ 
     fetch: async (url, options) => {
       fetchLog.push(url);
       if (url === "/api/languages") return { status: 200, ok: true, json: async () => ({ languages: LANGUAGES }) };
+      if (url === "/api/tts/info") return { status: 200, ok: true, json: async () => ttsInfo };
       const answer = await history(url);
       return { status: answer.status || 200, ok: (answer.status || 200) < 400, json: async () => answer.body };
     },
-    setTimeout: (callback) => { timers.push(callback); return timers.length; },
+    setTimeout: (callback, delay) => { timers.push(callback); delays.push(delay); return timers.length; },
     localStorage: { getItem: (k) => (storage.has(k) ? storage.get(k) : null), setItem: (k, v) => storage.set(k, String(v)) },
     sessionStorage: { getItem: () => null, setItem() {} },
     URLSearchParams, Object, Array, Map, Promise, Number, String, JSON, Math, Error, encodeURIComponent,
     PolyglotSpeech: {
-      createSpeaker: () => ({
-        speak: (text, lang) => { spoken.push([text, lang]); return speakerLog.speakFails ? Promise.reject(new Error(speakerLog.speakFails)) : Promise.resolve("browser"); },
+      createSpeaker: (env) => ({
+        _env: (speakerLog.onQuota = env.onQuota),
+        speak: (text, lang, choice) => { spoken.push([text, lang]); speakerLog.choices.push(choice); return speakerLog.speakFails ? Promise.reject(new Error(speakerLog.speakFails)) : Promise.resolve("browser"); },
+        browserVoiceNames: () => deviceVoices,
         stop: () => { speakerLog.stops += 1; },
         hasBrowserVoice: () => hasVoice,
       }),
     },
   };
+  if (streaming) sandbox.EventSource = FakeEventSource;
   sandbox.window = sandbox;
   sandbox.window.location = sandbox.location;
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(UI, "listen.js"), "utf8"), sandbox, { filename: "listen.js" });
   await flush();
   return {
-    els, fetchLog, spoken, speakerLog, storage, cssVars, sandbox,
+    els, fetchLog, spoken, speakerLog, storage, cssVars, sandbox, streams, delays,
     historyUrls: () => fetchLog.filter((u) => u.startsWith("/api/history")),
     // Runs the next scheduled poll and lets it finish.
     async poll() { const next = timers.shift(); assert.ok(next, "no poll is scheduled"); await next(); await flush(); },
@@ -376,4 +390,142 @@ test("a speech failure is shown to the listener, but a deliberate stop is not", 
   await page.els["listen-speak"].click();
   await page.poll();
   assert.equal(page.els["listen-note"].textContent.includes("stopped"), false);
+});
+
+// ---- rooms and pushed captions --------------------------------------------------------------
+
+test("a room in the address is followed: its history, its stream and its name on the page", async () => {
+  const page = await openPage({ search: "?room=hall-a&langs=th", streaming: true });
+  assert.match(page.historyUrls()[0], /&room=hall-a$/);
+  assert.equal(page.streams[0].url, "/api/events?x=1&room=hall-a");
+  assert.match(page.sandbox.document.title, /hall-a/);
+});
+
+test("the default room adds nothing to the requests", async () => {
+  const page = await openPage({ search: "?langs=th", streaming: true });
+  assert.doesNotMatch(page.historyUrls()[0], /room=/);
+  assert.equal(page.streams[0].url, "/api/events?x=1");
+});
+
+test("a pushed caption appears at once, without waiting for a poll", async () => {
+  const page = await openPage({ search: "?langs=th,km", streaming: true });
+  page.streams[0].emit("caption", { lang: "th", row: row("a", 1, { th: "pushed" }) });
+  assert.deepEqual(page.lines(page.els["listen-latest"]), [["th", "pushed"], ["km", "…"]]);
+  page.streams[0].emit("caption", { lang: "km", row: row("a", 1, { th: "pushed", km: "kh" }) });
+  assert.deepEqual(page.lines(page.els["listen-latest"]), [["th", "pushed"], ["km", "kh"]]);
+});
+
+test("a pushed caption is read aloud when reading is on", async () => {
+  const page = await openPage({ search: "?langs=th", streaming: true });
+  await page.els["listen-speak"].click();
+  page.streams[0].emit("caption", { lang: "th", row: row("a", 1, { th: "say this" }) });
+  await flush();
+  assert.deepEqual(page.spoken, [["say this", "th"]]);
+});
+
+test("a malformed pushed event is ignored", async () => {
+  const page = await openPage({ search: "?langs=th", streaming: true });
+  page.streams[0].emitRaw("caption", "{not json");
+  page.streams[0].emit("caption", { lang: "th" });
+  assert.equal(page.lines(page.els["listen-latest"]).length, 0);
+});
+
+test("clearing the room empties the page", async () => {
+  const page = await openPage({ search: "?langs=th", streaming: true, history: () => ({ body: { chunks: [row("a", 1, { th: "x" })] } }) });
+  page.streams[0].emit("clear", {});
+  assert.match(page.els["listen-latest"].textContent, /Waiting for the first caption/);
+  assert.equal(page.els["listen-earlier"].children.length, 0);
+});
+
+test("a reload event fetches everything again", async () => {
+  const page = await openPage({ search: "?langs=th", streaming: true });
+  const before = page.historyUrls().length;
+  page.streams[0].emit("reload", {});
+  await flush();
+  assert.equal(page.historyUrls().length, before + 1);
+});
+
+test("with an open stream polling slows to a safety net, and speeds up again when it drops", async () => {
+  const page = await openPage({ search: "?langs=th", streaming: true });
+  assert.equal(page.delays.at(-1), 1000);                      // not open yet
+  page.streams[0].onopen();
+  await page.poll();
+  assert.equal(page.delays.at(-1), 10000);
+  page.streams[0].onerror();
+  await page.poll();
+  assert.equal(page.delays.at(-1), 1000);
+});
+
+test("without EventSource the page simply polls every second", async () => {
+  const page = await openPage({ search: "?langs=th" });
+  assert.equal(page.streams.length, 0);
+  assert.equal(page.delays.at(-1), 1000);
+});
+
+// ---- voices and the speech allowance ---------------------------------------------------------
+
+test("the voice list offers automatic, the device's voices and the relay's voices", async () => {
+  const page = await openPage({ search: "?langs=th" });
+  await page.els["listen-speak"].click();
+  const options = page.els["listen-voice"].children.map((o) => [o.value, o.textContent]);
+  assert.deepEqual(options, [["", "Voice: automatic"], ["b:Device A", "Device: Device A"], ["r:Kore", "Relay: Kore"], ["r:Puck", "Relay: Puck"]]);
+  assert.equal(page.els["listen-voice"].hidden, false);
+  await page.els["listen-speak"].click();
+  assert.equal(page.els["listen-voice"].hidden, true);
+});
+
+test("a chosen voice is remembered per language and used for reading", async () => {
+  const replies = [{ chunks: [] }, { chunks: [row("a", 1, { th: "x" })] }];
+  const page = await openPage({ search: "?langs=th", history: () => ({ body: replies.shift() || { chunks: [] } }) });
+  await page.els["listen-speak"].click();
+  await page.els["listen-voice"].change("r:Puck");
+  assert.equal(page.storage.get("polyglot-voice-th"), "r:Puck");
+  assert.match(page.els["listen-note"].textContent, /relay's Puck voice/);
+  await page.poll();
+  assert.equal(JSON.stringify(page.speakerLog.choices.at(-1)), JSON.stringify({ relay: "Puck" }));
+});
+
+test("a remembered device voice is passed as a browser choice", async () => {
+  const replies = [{ chunks: [] }, { chunks: [row("a", 1, { th: "x" })] }];
+  const page = await openPage({ search: "?langs=th", stored: { "polyglot-voice-th": "b:Device A" }, history: () => ({ body: replies.shift() || { chunks: [] } }) });
+  await page.els["listen-speak"].click();
+  await page.poll();
+  assert.equal(JSON.stringify(page.speakerLog.choices.at(-1)), JSON.stringify({ browser: "Device A" }));
+});
+
+test("the listener is warned when only a few relay-voice clips are left today", async () => {
+  const page = await openPage({ search: "?langs=km", hasVoice: false, ttsInfo: { voices: [], quota: { left: 2 }, warn_when_left: 3 } });
+  await page.els["listen-speak"].click();
+  assert.match(page.els["listen-note"].textContent, /Only 2 relay-voice clips left today/);
+});
+
+test("the warning updates as clips are used, and says when none are left", async () => {
+  const page = await openPage({ search: "?langs=km", hasVoice: false, ttsInfo: { voices: [], quota: { left: 5 }, warn_when_left: 3 } });
+  await page.els["listen-speak"].click();
+  assert.doesNotMatch(page.els["listen-note"].textContent, /left today/);
+  page.speakerLog.onQuota(1);
+  assert.match(page.els["listen-note"].textContent, /Only 1 relay-voice clip left today/);
+  page.speakerLog.onQuota(0);
+  assert.match(page.els["listen-note"].textContent, /allowance for today is used up/);
+});
+
+test("no quota warning when the device's own voice is doing the reading", async () => {
+  const page = await openPage({ search: "?langs=th", hasVoice: true, ttsInfo: { voices: [], quota: { left: 0 }, warn_when_left: 3 } });
+  await page.els["listen-speak"].click();
+  assert.doesNotMatch(page.els["listen-note"].textContent, /allowance|left today/);
+});
+
+test("a page whose speech details cannot be loaded still reads aloud", async () => {
+  const page = await openPage({ search: "?langs=th", ttsInfo: null });
+  await page.els["listen-speak"].click();
+  assert.match(page.els["listen-note"].textContent, /read aloud/);
+});
+
+test("words still being spoken appear under the newest sentence until it is finished", async () => {
+  const page = await openPage({ search: "?langs=th", streaming: true });
+  page.streams[0].emit("interim", { text: "sawasdee khrap", lang: "th" });
+  assert.equal(page.els["listen-interim"].textContent, "\u2026 sawasdee khrap");
+  assert.equal(page.els["listen-interim"].hidden, false);
+  page.streams[0].emit("chunk", {});
+  assert.equal(page.els["listen-interim"].hidden, true);
 });

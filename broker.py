@@ -17,7 +17,7 @@ import signal
 import socket
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,7 +25,9 @@ from common import config
 from common import netutil
 from common.election import BullyElection
 from common.heartbeat import FailureDetector
-from common.protocol import ProtocolError, decode_stream, encode, recv_one
+from common.raft import RaftElection
+from common.protocol import ProtocolError, authenticate, decode_stream, encode, recv_one
+from job_journal import JobJournal
 
 
 LOG = logging.getLogger("polyglot.broker")
@@ -58,6 +60,8 @@ class WorkerConnection:
     mode: str = "unknown"
     # chunk_id -> the chunk, for every job sent to this worker and not yet completed
     assigned: dict[str, dict] = field(default_factory=dict)
+    # what the worker last reported about itself in a heartbeat (translations, failures, cache hits)
+    stats: dict[str, Any] = field(default_factory=dict)
 
     def send(self, message: dict[str, Any]) -> None:
         with self.send_lock:
@@ -138,28 +142,58 @@ class Broker:
         self._replication_lock = threading.Lock()
         self._replicate_adds: dict[str, dict] = {}
         self._replicate_done: list[list[str]] = []
+        # Unfinished jobs on disk (POLYGLOT_JOB_JOURNAL): loaded as if replicated, so the next leader replays them.
+        self.journal = JobJournal.from_env(broker_id)
+        if self.journal:
+            restored = self.journal.load()
+            now = time.time()
+            for chunk_id, lang, chunk, _at in restored:
+                self.replica[(chunk_id, lang)] = {"chunk": chunk, "at": now}
+            if restored:
+                LOG.info("Job journal holds %d unfinished jobs from before the restart", len(restored))
+        # Job outcomes since this broker started, per (outcome, language), for the metrics page.
+        self.counters: defaultdict[tuple[str, str], int] = defaultdict(int)
         self.stop_event = threading.Event()
         self.server: socket.socket | None = None
         self._clients: set[socket.socket] = set()
         self._clients_lock = threading.Lock()
-        self.election = BullyElection(
-            broker_id=broker_id,
-            peer_ids=[b["id"] for b in config.BROKERS],
-            request=self._peer_request,
-            announce=self._announce,
-            on_leader_change=self._leader_changed,
-            election_timeout=config.ELECTION_TIMEOUT,
-            logger=LOG,
-        )
+        if config.ELECTION_MODE == "raft":
+            state = (os.getenv("POLYGLOT_RAFT_STATE") or "").replace("{id}", str(broker_id)) or None
+            self.election = RaftElection(
+                broker_id=broker_id,
+                peer_ids=[b["id"] for b in config.BROKERS],
+                request=self._peer_request,
+                on_leader_change=self._leader_changed,
+                heartbeat_timeout=config.HEARTBEAT_TIMEOUT,
+                state_path=state,
+                logger=LOG,
+            )
+        else:
+            self.election = BullyElection(
+                broker_id=broker_id,
+                peer_ids=[b["id"] for b in config.BROKERS],
+                request=self._peer_request,
+                announce=self._announce,
+                on_leader_change=self._leader_changed,
+                election_timeout=config.ELECTION_TIMEOUT,
+                logger=LOG,
+            )
+
+    @property
+    def raft(self) -> bool:
+        return getattr(self.election, "mode", "bully") == "raft"
 
     @property
     def is_leader(self) -> bool:
         return self.election.leader_id == self.broker_id
 
-    def _leader_changed(self, leader_id: int) -> None:
+    def _leader_changed(self, leader_id: int | None) -> None:
         with self._clients_lock:
             was_serving = bool(self._clients) or bool(self.registry.all())
-        LOG.info("Leader is broker %s%s", leader_id, " (this replica)" if self.is_leader else "")
+        if leader_id is None:
+            LOG.info("No leader at the moment (election in progress, or no majority reachable)")
+        else:
+            LOG.info("Leader is broker %s%s", leader_id, " (this replica)" if self.is_leader else "")
         if not self.is_leader:
             with self._jobs_lock:       # only the leader owns in-flight work
                 self.pending.clear()
@@ -222,6 +256,8 @@ class Broker:
         self.shutdown()
 
     def _delayed_election(self) -> None:
+        if self.raft:
+            return              # a Raft broker waits to hear from a leader first, and stands only after its timeout
         time.sleep(0.25)
         if not self.stop_event.is_set():
             self.election.start()
@@ -231,6 +267,11 @@ class Broker:
         try:
             messages = decode_stream(conn)
             first = next(messages)
+            if not authenticate(first):
+                # POLYGLOT_CLUSTER_SECRET is set and this peer could not prove it knows it.
+                LOG.warning("Refused a %s connection from %s: missing or wrong cluster secret", first.get("type"), address[0])
+                conn.sendall(encode({"type": "error", "error": "authentication failed"}))
+                return
             kind = first["type"]
             if kind == "election":
                 candidate_id = int(first["candidate_id"])
@@ -241,8 +282,17 @@ class Broker:
                 self.election.receive_announcement(int(first["leader_id"]))
                 conn.sendall(encode({"type": "heartbeat_ack", "sender_id": self.broker_id, "leader_id": self.election.leader_id}))
                 return
+            if kind == "vote_request" and self.raft:
+                conn.sendall(encode(self.election.handle_vote_request(first)))
+                return
+            if kind == "leader_heartbeat" and self.raft:
+                conn.sendall(encode(self.election.handle_heartbeat(first)))
+                return
             if kind == "replicate_batch":
-                self._apply_replication(first)
+                if self.raft and int(first.get("term") or 0) < self.election.term:
+                    LOG.warning("Ignored replication from broker %s of an older term", first.get("leader_id"))
+                else:
+                    self._apply_replication(first)
                 conn.sendall(encode({"type": "heartbeat_ack", "sender_id": self.broker_id, "leader_id": self.election.leader_id}))
                 return
             if kind == "heartbeat" and first.get("role") == "broker":
@@ -267,7 +317,9 @@ class Broker:
                 self._flush_waiting(worker.lang)
                 for message in messages:
                     worker.last_seen = time.monotonic()
-                    if message["type"] == "translated_chunk":
+                    if message["type"] == "heartbeat" and isinstance(message.get("stats"), dict):
+                        worker.stats = {k: v for k, v in message["stats"].items() if isinstance(v, (int, float))}
+                    elif message["type"] == "translated_chunk":
                         self._on_translated(worker, message)
                     elif message["type"] == "chunk_status":
                         self._on_status(worker, message)
@@ -359,6 +411,7 @@ class Broker:
         """Hand one job to the least-loaded worker of the language. Returns False when it had to wait
         (or could not be delivered). Redeliveries pass the workers that already failed it as `excluded`."""
         key = (chunk.get("chunk_id"), lang)
+        self.counters[("redelivered" if attempts > 1 else "routed", lang)] += 1
         while True:
             worker = self.registry.choose(lang, excluded)
             if worker is None:
@@ -517,15 +570,19 @@ class Broker:
     # ---- replication to the standby brokers -----------------------------------------------
 
     def _replicate_add(self, chunk: dict, lang: str) -> None:
+        slim = {k: v for k, v in chunk.items() if k not in ("audio_pcm_b64", "auth")}  # the text pipeline only; audio is large
+        if self.journal:
+            self.journal.put(slim, [lang])
         if not self.peers:
             return
-        slim = {k: v for k, v in chunk.items() if k != "audio_pcm_b64"}     # the text pipeline only; audio is large
         with self._replication_lock:
             entry = self._replicate_adds.setdefault(str(chunk.get("chunk_id")), {"chunk": slim, "langs": []})
             if lang not in entry["langs"]:
                 entry["langs"].append(lang)
 
     def _replicate_finished(self, chunk_id: Any, lang: str) -> None:
+        if self.journal:
+            self.journal.remove([(str(chunk_id), lang)])
         if not self.peers:
             return
         with self._replication_lock:
@@ -548,7 +605,7 @@ class Broker:
             return False
         for start in range(0, max(len(adds), 1), 100):
             batch = {"type": "replicate_batch", "leader_id": self.broker_id, "adds": adds[start:start + 100],
-                     "done": done if start == 0 else []}
+                     "done": done if start == 0 else [], "term": getattr(self.election, "term", None)}
             for peer_id in self.peers:
                 self._peer_request(peer_id, batch)
         return True
@@ -572,6 +629,13 @@ class Broker:
                         self.replica[(str(chunk["chunk_id"]), lang)] = {"chunk": chunk, "at": now}
             for chunk_id, lang in batch.get("done", []):
                 self.replica.pop((str(chunk_id), lang), None)
+            if self.journal:                       # a standby keeps the leader's unfinished work on its own disk too
+                for item in batch.get("adds", []):
+                    chunk = item.get("chunk") or {}
+                    langs = [lang for lang in item.get("langs", []) if lang in config.TARGET_LANGUAGES]
+                    if chunk.get("chunk_id") is not None and langs:
+                        self.journal.put(chunk, langs)
+                self.journal.remove([(str(c), str(l)) for c, l in batch.get("done", [])])
             while len(self.replica) > REPLICA_MAX_JOBS:
                 self.replica.popitem(last=False)
             while self.replica and now - next(iter(self.replica.values()))["at"] > REPLICA_MAX_AGE:
@@ -594,6 +658,7 @@ class Broker:
             self._dispatch(entry["chunk"], lang, attempts=1, excluded=frozenset(), replicate=True,
                            detail="Recovered after a broker failover")
             replayed += 1
+            self.counters[("replayed", lang)] += 1
         if replayed:
             LOG.info("Replayed %s jobs that the previous leader had not finished", replayed)
 
@@ -601,6 +666,8 @@ class Broker:
 
     def update_job(self, message: dict, status: str) -> None:
         key = (message.get("chunk_id"), message.get("lang"))
+        if status in ("completed", "failed"):
+            self.counters[(status, str(key[1]))] += 1
         with self._jobs_lock:
             row = self.jobs.setdefault(key, {"chunk_id": key[0], "lang": key[1]})
             row.update(status=status, updated_at=time.time())
@@ -619,9 +686,15 @@ class Broker:
             jobs = [dict(row) for row in self.jobs.values()]
         members = [{"worker_id": w.worker_id, "lang": w.lang,
                     "mode": w.mode, "queue": len(w.assigned),
-                    "heartbeat_age": round(time.monotonic() - w.last_seen, 1)}
+                    "heartbeat_age": round(time.monotonic() - w.last_seen, 1), "stats": dict(w.stats)}
                    for w in self.registry.all()]
-        return {"members": members, "jobs": jobs}
+        with self._jobs_lock:
+            waiting = {lang: len(queue) for lang, queue in self.waiting.items() if queue}
+            pending = len(self.pending)
+        counters = [{"outcome": outcome, "lang": lang, "value": value} for (outcome, lang), value in sorted(self.counters.items())]
+        return {"members": members, "jobs": jobs, "counters": counters, "waiting": waiting, "pending": pending,
+                "broker_id": self.broker_id, "term": getattr(self.election, "term", None),
+                "election": getattr(self.election, "mode", "bully")}
 
     def _publish_translation(self, message: dict) -> None:
         lang = str(message.get("lang"))
@@ -639,6 +712,14 @@ class Broker:
         # detection take several times HEARTBEAT_TIMEOUT.
         detector = FailureDetector(config.HEARTBEAT_TIMEOUT)
         while not self.stop_event.wait(config.HEARTBEAT_INTERVAL):
+            if self.raft:
+                # Raft: the leader keeps asserting itself (and steps down without a majority); a follower
+                # that has not heard from a leader for its randomised timeout stands for election.
+                if self.is_leader:
+                    self.election.leader_tick()
+                elif self.election.heartbeat_expired():
+                    self.election.start()
+                continue
             if self.is_leader:
                 detector.seen()
                 self._yield_to_a_higher_broker()

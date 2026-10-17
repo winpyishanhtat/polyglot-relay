@@ -21,11 +21,17 @@
     let tail = Promise.resolve();
     let playing = null;     // the Audio element currently playing, so stop() can silence it
 
-    function browserVoice(lang) {
-      if (!synth || !Utterance || typeof synth.getVoices !== "function") return null;
+    function browserVoices(lang) {
+      if (!synth || !Utterance || typeof synth.getVoices !== "function") return [];
       const prefixes = VOICE_PREFIXES[lang] || [lang];
-      const voices = synth.getVoices() || [];
-      return voices.find((v) => prefixes.some((p) => String(v.lang || "").toLowerCase().replace("_", "-").split("-")[0] === p)) || null;
+      return (synth.getVoices() || []).filter((v) =>
+        prefixes.some((p) => String(v.lang || "").toLowerCase().replace("_", "-").split("-")[0] === p));
+    }
+
+    // The browser voice to use: the one chosen by name, else the first for the language.
+    function browserVoice(lang, name) {
+      const voices = browserVoices(lang);
+      return (name && voices.find((v) => v.name === name)) || voices[0] || null;
     }
 
     function viaBrowser(text, lang, voice) {
@@ -39,8 +45,11 @@
       });
     }
 
-    async function viaServer(text, lang) {
-      const response = await post("/api/tts", { method: "POST", headers: headers(), body: JSON.stringify({ text, lang }) });
+    async function viaServer(text, lang, relayVoice) {
+      const body = relayVoice ? { text, lang, voice: relayVoice } : { text, lang };
+      const response = await post("/api/tts", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+      const left = response.headers && typeof response.headers.get === "function" ? response.headers.get("X-Speech-Quota-Left") : null;
+      if (left !== null && left !== undefined && typeof env.onQuota === "function") env.onQuota(Number(left));
       if (!response.ok) {
         let message = "Speech is not available right now";
         try { message = (await response.json()).error || message; } catch (_) { /* keep the generic message */ }
@@ -63,22 +72,25 @@
       return "server";
     }
 
-    async function speakNow(text, lang) {
-      const voice = browserVoice(lang);
-      if (voice) {
-        try { return await viaBrowser(text, lang, voice); } catch (_) { /* fall through to the server voice */ }
+    // choice: undefined (best available), { browser: "voice name" }, or { relay: "Kore" } for the relay's voice.
+    async function speakNow(text, lang, choice) {
+      if (!(choice && choice.relay)) {
+        const voice = browserVoice(lang, choice && choice.browser);
+        if (voice) {
+          try { return await viaBrowser(text, lang, voice); } catch (_) { /* fall through to the server voice */ }
+        }
       }
-      return viaServer(text, lang);
+      return viaServer(text, lang, choice && choice.relay);
     }
 
     return {
       // Speaks after anything already queued. Resolves with "browser" or "server"; rejects with a readable
       // message when neither could (and with "stopped" if stop() was called first).
-      speak(text, lang) {
+      speak(text, lang, choice) {
         const mine = generation;
         const run = tail.then(() => {
           if (mine !== generation) throw new Error("stopped");
-          return speakNow(String(text), lang);
+          return speakNow(String(text), lang, choice);
         });
         tail = run.catch(() => {});
         return run;
@@ -90,6 +102,7 @@
         if (playing) { const audio = playing; playing = null; if (typeof audio.onended === "function") audio.onended(); }
       },
       hasBrowserVoice: (lang) => Boolean(browserVoice(lang)),
+      browserVoiceNames: (lang) => browserVoices(lang).map((v) => v.name).filter(Boolean),
     };
   }
 

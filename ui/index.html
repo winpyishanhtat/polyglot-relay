@@ -20,6 +20,11 @@
         <span><strong>Polyglot Relay</strong><small>Live interpretation console</small></span>
       </a>
       <div class="topbar-meta">
+        <form id="room-form" class="room-form" title="Each room is its own audience on the same relay">
+          <label for="room-input">Room</label>
+          <input id="room-input" name="room" maxlength="32" autocomplete="off" spellcheck="false" value="main">
+          <button type="submit" class="text-button">Go</button>
+        </form>
         <span id="network-pill" class="network-pill"><i></i><span>Connecting</span></span>
         <span id="clock" class="clock">--:--:--</span>
       </div>
@@ -60,6 +65,7 @@
             </label>
             <span class="record-timer" id="record-timer" hidden>00:00</span>
           </div>
+          <p id="live-interim" class="live-interim" role="status" aria-live="polite" hidden></p>
           <video id="record-preview" class="record-preview" autoplay muted playsinline hidden></video>
 
           <div class="source-row">
@@ -109,7 +115,7 @@
         <div class="section-heading">
           <div><h2 id="captions-title">Live captions</h2></div>
           <span class="heading-actions">
-            <a class="text-button" href="/listen">Listener pages</a>
+            <a class="text-button" id="listen-link" href="/listen">Listener page</a>
             <button id="clear-button" class="text-button" type="button">Clear captions &amp; history</button>
           </span>
         </div>

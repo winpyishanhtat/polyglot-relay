@@ -1,0 +1,16 @@
+# Used by .github/workflows/ci.yml: the whole relay (three brokers, nine mock worker pools, the dashboard)
+# without the heavy Whisper image, so a smoke, load or chaos test can start in a minute on a CI runner.
+# Typed captions need no speech recognition, which is all these tests send.
+#
+#   docker compose -f compose.yaml -f compose.ci.yaml up -d --build --wait
+services:
+  ui:
+    image: polyglot-relay:mock
+    build:
+      context: .
+      target: mock
+    environment:
+      POLYGLOT_PRELOAD_WHISPER: "0"
+      POLYGLOT_RATE_LIMIT_PER_MINUTE: "0"
+      POLYGLOT_MAX_ROOMS: "50"
+    volumes: !reset []

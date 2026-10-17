@@ -59,7 +59,7 @@ const LANGUAGES = ["en", "my", "id", "ms", "th", "vi", "tl", "km", "lo"].map((co
   code, name: code.toUpperCase() + "-name", native: code, group: "ASEAN",
 }));
 
-function load({ fetchImpl, search, stored, speech = false } = {}) {
+function load({ fetchImpl, search, stored, speech = false, streaming = false } = {}) {
   const registry = new Map();
   const get = (selector) => {
     if (!registry.has(selector)) registry.set(selector, new FakeElement());
@@ -96,6 +96,14 @@ function load({ fetchImpl, search, stored, speech = false } = {}) {
     confirm: () => true,
     URL: { createObjectURL: () => "blob:default", revokeObjectURL() {} },
   };
+  if (streaming) {
+    sandbox.streams = [];
+    sandbox.EventSource = class {
+      constructor(url) { this.url = url; this.listeners = {}; sandbox.streams.push(this); }
+      addEventListener(kind, handler) { (this.listeners[kind] ||= []).push(handler); }
+      emit(kind, data) { for (const handler of this.listeners[kind] || []) handler({ data: data === undefined ? "{}" : JSON.stringify(data) }); }
+    };
+  }
   sandbox.window = sandbox;
   if (search !== undefined) sandbox.location = { search };
   vm.createContext(sandbox);
@@ -802,4 +810,108 @@ test("the Listen request carries the access token when the page was opened with 
   for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
   const [, options] = page.calls.find(([url]) => url === "/api/tts");
   assert.equal(options.headers["X-Access-Token"], "s3cret");
+});
+
+// ---- rooms and pushed updates --------------------------------------------------------------
+
+async function bootedWith(options) {
+  const page = load(options);
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+  return page;
+}
+
+test("in a room every request carries the room", async () => {
+  const page = await bootedWith({ search: "?room=hall-a" });
+  await page.sandbox.refresh();
+  await page.sandbox.post("/api/captions", { text: "hi" });
+  const urls = page.calls.map(([url]) => url);
+  assert.ok(urls.includes("/api/status?room=hall-a"), urls.join(" "));
+  assert.ok(urls.includes("/api/captions?room=hall-a"), urls.join(" "));
+  assert.ok(urls.some((u) => u.startsWith("/api/history?") && u.includes("room=hall-a")), urls.join(" "));
+});
+
+test("the default room leaves the requests as they were", async () => {
+  const page = await bootedWith({ search: "" });
+  await page.sandbox.refresh();
+  const urls = page.calls.map(([url]) => url);
+  assert.ok(urls.includes("/api/status"));
+  assert.ok(!urls.some((u) => u.includes("room=")), urls.join(" "));
+});
+
+test("withRoom adds the room with the right separator", async () => {
+  const page = await bootedWith({ search: "?room=r2" });
+  assert.equal(page.run('withRoom("/api/status")'), "/api/status?room=r2");
+  assert.equal(page.run('withRoom("/api/live/slice?source_lang=th")'), "/api/live/slice?source_lang=th&room=r2");
+});
+
+test("the dashboard opens a push stream for its room", async () => {
+  const page = await bootedWith({ search: "?room=hall-b", streaming: true });
+  assert.equal(page.sandbox.streams.length, 1);
+  assert.equal(page.sandbox.streams[0].url, "/api/events?room=hall-b");
+});
+
+test("a pushed caption refreshes the dashboard straight away", async () => {
+  const page = await bootedWith({ streaming: true });
+  const timers = [];
+  page.sandbox.setTimeout = (callback) => { timers.push(callback); return timers.length; };
+  const before = page.calls.filter(([url]) => url === "/api/status").length;
+  page.sandbox.streams[0].emit("caption");
+  page.sandbox.streams[0].emit("caption");                    // a burst is folded into one refresh
+  for (const callback of timers.splice(0)) await callback();
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page.calls.filter(([url]) => url === "/api/status").length, before + 1);
+  assert.ok(page.calls.some(([url]) => String(url).startsWith("/api/history")));
+});
+
+test("polling slows down while the stream is open and speeds up when it drops", async () => {
+  const page = await bootedWith({ streaming: true });
+  assert.equal(page.run("pollDelay()"), 1000);
+  page.sandbox.streams[0].onopen();
+  assert.equal(page.run("pollDelay()"), 4000);
+  page.sandbox.streams[0].onerror();
+  assert.equal(page.run("pollDelay()"), 1000);
+});
+
+// ---- interim captions and the voice band ---------------------------------------------------
+
+test("words still being spoken are shown as a preview and cleared by the finished sentence", async () => {
+  const page = await bootedWith({ streaming: true });
+  const box = page.get("#live-interim");
+  page.sandbox.streams[0].emit("interim", { text: "good morning every", lang: "en" });
+  assert.equal(box.textContent, "Hearing: good morning every");
+  assert.equal(box.hidden, false);
+  page.sandbox.streams[0].emit("chunk", { chunk_id: "c1" });
+  assert.equal(box.textContent, "");
+  assert.equal(box.hidden, true);
+});
+
+test("the voice-band share is computed from the microphone spectrum", async () => {
+  const page = await bootedWith({});
+  // 2048-point FFT at 48 kHz: 23.4 Hz per bin. Put all energy at ~1 kHz (voice) then at ~60 Hz (hum).
+  page.run(`
+    liveAudioContext = { sampleRate: 48000 };
+    liveAnalyser = { fftSize: 2048, frequencyBinCount: 1024, bin: 43,
+      getFloatFrequencyData(out) { out.fill(-200); out[this.bin] = -20; } };
+  `);
+  assert.ok(page.run("currentVoiceRatio()") > 0.99);
+  page.run("liveAnalyser.bin = 3; liveSpectrum = null;");
+  assert.ok(page.run("currentVoiceRatio()") < 0.01);
+  page.run("liveAnalyser = null;");
+  assert.equal(page.run("currentVoiceRatio()"), undefined);
+});
+
+test("an interim is only sent while someone is speaking a phrase that has run a while", async () => {
+  const page = await bootedWith({});
+  page.run(`
+    liveActive = true; liveSource = "th";
+    liveSlicer = { inSpeech: true };
+    liveRecorder = { state: "recording", startedAt: Date.now() - 3000, parts: [], mimeType: "audio/webm",
+      requested: 0, requestData() { this.requested += 1; } };
+  `);
+  page.run("sendInterim()");
+  assert.equal(page.run("liveRecorder.requested"), 1);
+  page.run("liveSlicer.inSpeech = false; sendInterim()");
+  assert.equal(page.run("liveRecorder.requested"), 1);            // a pause: nothing to preview
+  page.run("liveSlicer.inSpeech = true; liveRecorder.startedAt = Date.now(); sendInterim()");
+  assert.equal(page.run("liveRecorder.requested"), 1);            // the phrase has only just started
 });

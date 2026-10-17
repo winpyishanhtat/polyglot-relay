@@ -17,6 +17,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from typing import Any
 
+import fragment_guard
 from common import config
 from common.discovery import connect_to_leader
 from common.protocol import ProtocolError, decode_stream, encode
@@ -123,7 +124,8 @@ class TranscriptProducer:
 
     def send(self, text: str, chunk_id: str, audio_pcm: bytes | None = None,
              audio_rate: int = 16000, source_lang: str | None = None,
-             pivot_en: str | None = None, targets: list[str] | None = None) -> None:
+             pivot_en: str | None = None, targets: list[str] | None = None,
+             context: list[str] | None = None) -> None:
         ack_id = uuid.uuid4().hex[:12]
         message = {"type": "transcript_chunk", "chunk_id": chunk_id, "ack_id": ack_id,
                    "text": text, "timestamp": time.time()}
@@ -136,6 +138,8 @@ class TranscriptProducer:
             message["pivot_en"] = pivot_en  # one shared English rendering for workers to reuse
         if targets is not None:
             message["targets"] = list(targets)  # route to only these languages
+        if context:
+            message["context"] = [str(line) for line in context][-5:]  # what was said just before, for the translator
         with self._send_lock:
             self._remember(ack_id, message)
             while True:
@@ -456,7 +460,7 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
                 continue  # silence, not a failure: nothing to transcribe, nothing missed
             gemini_text = _transcribe_window_via_gemini(window, sample_rate, language)
             if gemini_text is not None:
-                if gemini_text:
+                if gemini_text and not _spurious(gemini_text, window):
                     yield gemini_text, _pcm16(window), language
                 continue
             if language in _GEMINI_STT_LANGUAGES:
@@ -512,8 +516,24 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
                 if recovered:
                     text, detected = recovered
 
-        if text:
+        if text and not _spurious(text, window):
             yield text, _pcm16(window), detected
+
+
+def _loudness(window: Any) -> float | None:
+    try:
+        return float((window.astype("float32") ** 2).mean() ** 0.5)
+    except Exception:  # not an array (a test double): loudness unknown
+        return None
+
+
+def _spurious(text: str, window: Any) -> bool:
+    """A transcript invented for silence or music (see fragment_guard.py) is dropped, not translated."""
+    rms = _loudness(window)
+    if fragment_guard.is_spurious(text, rms):
+        LOG.info("Dropped a fragment that is not speech (%s): %r", fragment_guard.reason(text, rms), text[:80])
+        return True
+    return False
 
 
 def transcribe_microphone(model_name: str, language: str | None = None) -> Iterator[tuple[str, bytes]]:

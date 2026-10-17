@@ -10,3 +10,4 @@ eval/results.json
 eval/scenario_events.jsonl
 .pytest_cache
 .mypy_cache
+monitoring/view-token

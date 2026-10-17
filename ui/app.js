@@ -7,6 +7,15 @@ try {
   accessToken = new URLSearchParams(window.location.search).get("token") || sessionStorage.getItem("polyglot-token") || "";
   if (accessToken) sessionStorage.setItem("polyglot-token", accessToken);
 } catch (_) { /* no address bar or storage here: stay open */ }
+// Each room is its own audience on the same relay: ?room=hall-a. No room means the default one.
+let ROOM = "main";
+try {
+  ROOM = (new URLSearchParams(window.location.search).get("room") || "main").toLowerCase();
+} catch (_) { /* no address bar here: the default room */ }
+function withRoom(path) {
+  if (ROOM === "main") return path;
+  return `${path}${path.includes("?") ? "&" : "?"}room=${encodeURIComponent(ROOM)}`;
+}
 function authHeaders(headers = {}) {
   return accessToken ? { ...headers, "X-Access-Token": accessToken } : headers;
 }
@@ -43,7 +52,7 @@ function showToast(message) {
 }
 
 async function post(path, body = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(withRoom(path), {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
@@ -399,7 +408,7 @@ function renderActivity(items) {
 
 async function refresh() {
   try {
-    const response = await fetch("/api/status", { cache: "no-store" });
+    const response = await fetch(withRoom("/api/status"), { cache: "no-store" });
     if (!response.ok) throw new Error("Dashboard API unavailable");
     const data = await response.json();
     renderNetwork(data);
@@ -434,7 +443,7 @@ async function postAudio(blob, sourceLang, label) {
   uploadSending = true;
   setComposerBusy(true, `Transcribing ${label}…`);
   try {
-    const response = await fetch(`/api/captions/audio?source_lang=${encodeURIComponent(sourceLang)}`, {
+    const response = await fetch(withRoom(`/api/captions/audio?source_lang=${encodeURIComponent(sourceLang)}`), {
       method: "POST",
       headers: authHeaders({ "Content-Type": blob.type || "application/octet-stream" }),
       body: blob,
@@ -557,6 +566,10 @@ let liveSendChain = Promise.resolve();
 let liveAudioContext = null;
 let liveAnalyser = null;
 let liveLevels = null;
+let liveSpectrum = null;
+let liveInterimTimer = null;
+let liveInterimWanted = false;
+const INTERIM_EVERY_MS = 2500;
 let liveSlicer = null;
 const LIVE_MIN_SLICE_MS = 700; // a shorter tail (e.g. at Stop) is mostly noise
 const LIVE_LEVEL_POLL_MS = 50;
@@ -565,7 +578,12 @@ function startLiveSlice() {
   const parts = [];
   const startedAt = Date.now();
   const recorder = liveMimeType ? new MediaRecorder(liveStream, { mimeType: liveMimeType }) : new MediaRecorder(liveStream);
-  recorder.addEventListener("dataavailable", (event) => { if (event.data.size) parts.push(event.data); });
+  recorder.parts = parts;
+  recorder.startedAt = startedAt;
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data.size) parts.push(event.data);
+    if (recorder.onInterimData && recorder.state === "recording") { const send = recorder.onInterimData; recorder.onInterimData = null; send(); }
+  });
   recorder.addEventListener("stop", () => {
     if (Date.now() - startedAt < LIVE_MIN_SLICE_MS) return;
     if (recorder.hadSpeech === false) return; // silence: nothing worth transcribing
@@ -593,9 +611,47 @@ function currentLevel() {
   return Math.sqrt(sum / liveLevels.length);
 }
 
+// The share of the last reading's energy in the voice band (300-3400 Hz): hum, rumble and hiss score low.
+function currentVoiceRatio() {
+  if (!liveAnalyser || typeof liveAnalyser.getFloatFrequencyData !== "function" || !liveAudioContext) return undefined;
+  if (!liveSpectrum) liveSpectrum = new Float32Array(liveAnalyser.frequencyBinCount);
+  liveAnalyser.getFloatFrequencyData(liveSpectrum);
+  const binHz = liveAudioContext.sampleRate / liveAnalyser.fftSize;
+  let voice = 0, total = 0;
+  for (let i = 1; i < liveSpectrum.length; i++) {
+    const power = Math.pow(10, liveSpectrum[i] / 10);
+    total += power;
+    const hz = i * binHz;
+    if (hz >= 300 && hz <= 3400) voice += power;
+  }
+  return total > 0 ? voice / total : undefined;
+}
+
 function liveTick() {
-  const decision = liveSlicer.push(currentLevel(), performance.now());
+  const decision = liveSlicer.push(currentLevel(), performance.now(), currentVoiceRatio());
   if (decision.cut) rotateLiveSlice(decision.hadSpeech);
+}
+
+// Interim captions: while a phrase is still being spoken, send what has been recorded of it so far.
+function sendInterim() {
+  const recorder = liveRecorder;
+  if (!liveActive || !recorder || recorder.state !== "recording" || !liveSlicer || !liveSlicer.inSpeech) return;
+  if (Date.now() - recorder.startedAt < 1500) return;
+  recorder.onInterimData = () => {
+    const blob = new Blob(recorder.parts, { type: recorder.mimeType || "application/octet-stream" });
+    if (!blob.size) return;
+    fetch(withRoom(`/api/live/interim?source_lang=${encodeURIComponent(liveSource)}`), {
+      method: "POST", headers: authHeaders({ "Content-Type": blob.type || "application/octet-stream" }), body: blob,
+    }).catch(() => { /* an interim is only a preview: nothing to retry */ });
+  };
+  recorder.requestData();
+}
+
+function showInterim(data) {
+  const box = $("#live-interim");
+  if (!box) return;
+  box.textContent = data && data.text ? `Hearing: ${data.text}` : "";
+  box.hidden = !(data && data.text);
 }
 
 // Posts are chained so slices reach the server in the order they were
@@ -603,7 +659,7 @@ function liveTick() {
 function sendLiveSlice(blob, sourceLang) {
   liveSendChain = liveSendChain.then(async () => {
     try {
-      const response = await fetch(`/api/live/slice?source_lang=${encodeURIComponent(sourceLang)}`, {
+      const response = await fetch(withRoom(`/api/live/slice?source_lang=${encodeURIComponent(sourceLang)}`), {
         method: "POST",
         headers: authHeaders({ "Content-Type": blob.type || "application/octet-stream" }),
         body: blob,
@@ -631,9 +687,11 @@ async function startLive() {
     return;
   }
   let limits = { min_ms: 2000, max_ms: 8000, pause_ms: 350 };
+  liveInterimWanted = false;
   try {
-    const status = await (await fetch("/api/status", { cache: "no-store" })).json();
+    const status = await (await fetch(withRoom("/api/status"), { cache: "no-store" })).json();
     limits = status.settings.live_slicing || limits;
+    liveInterimWanted = Boolean(status.settings.interim);
   } catch (error) { /* keep the defaults */ }
 
   liveActive = true;
@@ -652,6 +710,7 @@ async function startLive() {
 
   liveRecorder = startLiveSlice();
   liveTimer = setInterval(liveTick, LIVE_LEVEL_POLL_MS);
+  if (liveInterimWanted) liveInterimTimer = setInterval(sendInterim, INTERIM_EVERY_MS);
 
   for (const id of ["#source-lang", "#audio-file-input", "#include-video", "#live-mode", "#demo-button"]) $(id).disabled = true;
   $("#composer-status").textContent = "Live - speak now; captions follow each pause in your speech";
@@ -666,6 +725,8 @@ async function startLive() {
 function stopLive() {
   liveActive = false;
   clearInterval(liveTimer);
+  clearInterval(liveInterimTimer);
+  showInterim(null);
   if (liveRecorder && liveRecorder.state !== "inactive") {
     liveRecorder.hadSpeech = liveSlicer.hadSpeech; // the unfinished last slice, flushed now
     liveRecorder.stop();
@@ -673,7 +734,7 @@ function stopLive() {
   liveRecorder = null;
   if (liveAudioContext) {
     liveAudioContext.close();
-    liveAudioContext = liveAnalyser = liveSlicer = liveLevels = null;
+    liveAudioContext = liveAnalyser = liveSlicer = liveLevels = liveSpectrum = null;
   }
   if (liveStream) {
     for (const track of liveStream.getTracks()) track.stop();
@@ -747,6 +808,7 @@ function historyParams(extra = {}) {
   }
   params.set("langs", LANGS.filter((l) => historyView.langs.has(l.code)).map((l) => l.code).join(","));
   if (historyView.query) params.set("q", historyView.query);
+  if (ROOM !== "main") params.set("room", ROOM);
   for (const [key, value] of Object.entries(extra)) params.set(key, value);
   return params;
 }
@@ -918,7 +980,12 @@ function buildHistoryControls() {
     button.addEventListener("click", () => exportHistory(button.dataset.export));
   }
   // Live ranges keep up with what is being said; a custom range stays put.
-  setInterval(() => { if (historyView.follow && historyView.range !== "custom") loadHistory(); }, 2000);
+  // With a push stream the history reloads when something changes, so this is only a slow safety net.
+  let historyTick = 0;
+  setInterval(() => {
+    historyTick += 1;
+    if (historyView.follow && historyView.range !== "custom" && (!streamOpen || historyTick % 5 === 0)) loadHistory();
+  }, 2000);
   loadHistory();
 }
 
@@ -933,6 +1000,64 @@ $("#clear-button").addEventListener("click", async () => {
 
 setInterval(() => { $("#clock").textContent = new Date().toLocaleTimeString(); }, 1000);
 
+// ---- rooms ------------------------------------------------------------------
+
+function buildRoomControls() {
+  const input = $("#room-input");
+  const form = $("#room-form");
+  if (!input || !form) return;
+  input.value = ROOM;
+  const listen = $("#listen-link");
+  if (listen) listen.href = ROOM === "main" ? "/listen" : `/listen?room=${encodeURIComponent(ROOM)}`;
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const name = String(input.value || "").trim().toLowerCase() || "main";
+    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(name)) {
+      showToast("A room name is up to 32 lowercase letters, digits or dashes");
+      return;
+    }
+    const params = new URLSearchParams(window.location.search);
+    if (name === "main") params.delete("room"); else params.set("room", name);
+    const query = params.toString();
+    window.location.search = query ? `?${query}` : "";
+  });
+}
+
+// ---- push updates -------------------------------------------------------------
+// The server pushes every change of this room over /api/events (Server-Sent Events), so captions appear the
+// moment they arrive. The status poll then only keeps the network view fresh; without a stream (an old
+// browser, or a proxy that blocks it) the page polls every second as before.
+
+let streamOpen = false;
+let refreshTimer = null;
+let historyTimer = null;
+
+function soon(kind) {
+  if (kind !== "history" && !refreshTimer) {
+    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 120);
+  }
+  if ((kind === "history" || kind === "both") && !historyTimer) {
+    historyTimer = setTimeout(() => {
+      historyTimer = null;
+      if (historyView.follow && historyView.range !== "custom") loadHistory();
+    }, 250);
+  }
+}
+
+function openStream() {
+  if (typeof EventSource === "undefined") return null;
+  const stream = new EventSource(withRoom("/api/events"));
+  stream.onopen = () => { streamOpen = true; };
+  stream.onerror = () => { streamOpen = false; };       // the browser reconnects by itself
+  for (const kind of ["chunk", "caption", "clear", "reload"]) stream.addEventListener(kind, () => soon("both"));
+  for (const kind of ["activity", "workers"]) stream.addEventListener(kind, () => soon("status"));
+  stream.addEventListener("interim", (event) => { try { showInterim(JSON.parse(event.data)); } catch (_) { /* ignore */ } });
+  stream.addEventListener("chunk", () => showInterim(null));            // the finished sentence replaces the preview
+  return stream;
+}
+
+function pollDelay() { return streamOpen ? 4000 : 1000; }
+
 async function boot() {
   await loadLanguages();
   buildChannelDial();
@@ -940,7 +1065,9 @@ async function boot() {
   buildGroupTabs();
   buildCaptionGrid();
   buildHistoryControls();
-  async function poll() { await refresh(); setTimeout(poll, 1000); }
+  buildRoomControls();
+  openStream();
+  async function poll() { await refresh(); setTimeout(poll, pollDelay()); }
   poll();
 }
 

@@ -48,8 +48,15 @@ Two broker replicas run a real **Bully leader-election** protocol; translator wo
 - **Self-healing** — dead leader → automatic election; dead worker → its pool keeps running; both invisible to listeners
 - **Web dashboard** — upload/record audio or send typed text, watch all 9 language feeds and cluster health live
 - **Listener page** — `/listen` shows every sentence in all the languages you pick at once, and can read one aloud
-- **At-least-once delivery** — a caption is never lost to a dead worker or broker (see "Delivery guarantees")
-- **Over 800 automated tests** (plus 110 for the browser scripts) covering the protocol, election, delivery, translation routing and the dashboard
+- **At-least-once delivery** — a caption is never lost to a dead worker or broker, even if every broker restarts (jobs are journalled to disk)
+- **Rooms** — many separate audiences on one relay (`?room=hall-a`), each with its own captions and history
+- **Push updates** — captions reach browsers the moment they are translated (Server-Sent Events), not on the next poll
+- **Translation with context and a glossary** — the previous sentences and an event glossary keep names and terms consistent
+- **Raft-style election (optional)** — majority votes and terms, so a network split can never produce two leaders
+- **Authenticated cluster** — a shared secret (HMAC) that every broker, worker and listener must prove
+- **Monitoring** — Prometheus metrics and a ready-made Grafana dashboard: delay per language, queues, redeliveries, leadership
+- **Autoscaling** — worker pools grow and shrink with their queues
+- **Over 1,000 automated tests** (plus 138 for the browser scripts), CI on every push, load and chaos tests
 
 ## Quick start
 
@@ -91,9 +98,16 @@ Full Docker walkthrough — including a pure-Gemini overlay, worker-failure and 
 ├── translator_worker.py       # Registers with leader; translates; serves listeners
 ├── listener_client.py         # Terminal client: connects to an assigned worker, displays captions
 ├── web_ui.py + ui/            # Web dashboard — the primary way to run this
-├── history.py                  # Caption history exports (text, CSV, JSON, SRT)
+├── history.py                  # Caption history: SQLite store per room, exports (text, CSV, JSON, SRT)
+├── glossary.py                 # Event glossary and translation context
+├── fragment_guard.py           # Drops transcripts invented for silence or music
+├── job_journal.py              # Unfinished jobs on each broker's disk
+├── metrics.py                  # Prometheus metrics (served at /metrics)
+├── tts.py                      # Read-aloud: Gemini speech, disk cache, voices, daily allowance
+├── monitoring/, compose.monitoring.yaml   # Prometheus + Grafana dashboard
+├── tools/                      # smoke_test, load_test, chaos_test, autoscale
 ├── gemini_rate_gate.py         # Shared rate limiter for Gemini's free tier
-├── common/                     # Protocol, election, heartbeat, discovery, config
+├── common/                     # Protocol (+ HMAC auth), Bully and Raft election, heartbeat, discovery, config
 ├── eval/                       # Metrics (CER/WER/chrF++ with bootstrap CIs), FLEURS-style runner, failover trials
 ├── tests/                      # 400+ test suite (unittest + Node), ~93% line/branch coverage
 ├── Dockerfile, compose*.yaml   # Multi-stage build + overlays (mock / LibreTranslate+Gemini / pure Gemini)
@@ -122,8 +136,9 @@ The defaults suit one person on one machine. Before others can reach it:
    microphone on `https://` or `localhost`.
 3. Keep `POLYGLOT_RATE_LIMIT_PER_MINUTE` (default 240 changes per client address) and set a spend
    cap and key restriction in Google Cloud. If the proxy hides client addresses, limit there too.
-4. The broker (7001/7002) and LibreTranslate (5001) ports are published on `127.0.0.1` only, because
-   the broker protocol has no authentication. Do not expose them.
+4. Set `POLYGLOT_CLUSTER_SECRET` (see "Security: the cluster secret"), so only processes that know it can
+   join the relay. The broker (7001-7003) and LibreTranslate (5001) ports are still published on
+   `127.0.0.1` only; keep it that way.
 5. Audio and text are sent to the Gemini API: tell speakers and check Google's current terms for
    your tier. Captions are held in memory only unless you set `POLYGLOT_HISTORY_FILE` (see History).
 6. To make *viewing* private too, set `POLYGLOT_VIEW_TOKEN`. Every page and read then needs it, and
@@ -131,7 +146,26 @@ The defaults suit one person on one machine. Before others can reach it:
    stores it in an HttpOnly cookie. The access token also opens the room, so the presenter can watch it,
    but a viewer's token never allows changes. With both set, viewers read and listen, the presenter changes.
 
-This is still one shared room per dashboard: everyone sees the same captions.
+## Rooms
+
+One relay can serve many separate audiences. Add `?room=NAME` to the dashboard address (or type a name in the
+**Room** box at the top): that room has its own captions, chunk table, live microphone, history and exports,
+and its own listener page (`/listen?room=NAME`). Names are up to 32 lowercase letters, digits or dashes; the
+default room is `main`. Rooms are created on first use, up to `POLYGLOT_MAX_ROOMS` (default 20), and rooms
+with saved history come back after a restart. The brokers and workers do not know about rooms: the room
+travels in the chunk id (`hall-a~ui-...`), so every room shares the same worker pools and failover. Every API
+takes the `room` parameter (`/api/history?room=hall-a`, `POST /api/captions?room=hall-a`, ...), and
+`/api/rooms` lists them.
+
+## Push updates
+
+Browsers keep one connection open to `/api/events?room=NAME` (Server-Sent Events) and the dashboard pushes
+every new sentence, translation, activity line and worker change the moment it happens, so captions appear
+as soon as a worker answers instead of on the next once-a-second poll. A browser that reconnects sends the last
+event it saw and gets what it missed; one that has fallen too far behind is told to reload. While the stream
+is open the pages poll only as a safety net (the dashboard every 4 s for network status, the listener page
+every 10 s); without it (an old browser, a proxy that buffers) they poll every second as before. Behind nginx,
+turn off proxy buffering for `/api/events` (the server already sends `X-Accel-Buffering: no`).
 
 ## Listener page and read-aloud
 
@@ -149,6 +183,22 @@ requests per day per model, and the page shows Google's message when that runs o
 main dashboard also has a **Listen** button. `/api/tts` needs a token when one is set, and is rate limited
 like every other POST.
 
+- **Voices:** beside **Read aloud** a voice list offers the device's own voices for the language and the
+  relay's Gemini voices; the choice is remembered per language. `GEMINI_TTS_VOICE_TH` (any language code) sets
+  the relay's default voice for one language.
+- **Clips on disk:** with `POLYGLOT_TTS_CACHE_DIR` (the Compose stack uses `/data/tts`) a phrase is synthesised
+  once and kept, up to `POLYGLOT_TTS_CACHE_MB` (default 200 MB, oldest unheard first).
+- **The daily allowance:** every Gemini speech call is counted per model per Pacific day (Google's quota day).
+  Set `POLYGLOT_TTS_DAILY_LIMIT` to your allowance (10 on the free tier) and the listener page warns when only a
+  few relay-voice clips are left, and says so when they are gone instead of failing; once Google answers that a
+  model's daily quota is used up, that model is not called again until the reset. `GET /api/tts/info` reports
+  the voices and what is left.
+- **Words while speaking:** with `POLYGLOT_INTERIM=1` the dashboard sends the phrase heard so far every 2.5 s
+  while someone is talking, and the transcript appears in grey on the dashboard and under the newest sentence
+  on the listener page, replaced by the real caption when the phrase ends. Each preview costs a transcription
+  (a Gemini call for Burmese, Khmer, Lao and anything Gemini-first), so it is off by default; previews are
+  skipped whenever finished speech is waiting.
+
 ## Brokers and failover
 
 The Compose stack runs **three broker replicas** (`POLYGLOT_BROKER_COUNT=3`, ids 1-3; the highest live id
@@ -159,6 +209,27 @@ The defaults detect a dead leader after three missed 1 s heartbeats; for faster 
 host is starved of CPU). Name lookups for a stopped container take about 4 s in Docker, so every connection
 to a broker or worker goes through `common/netutil.py`, which puts a deadline on the lookup and remembers
 failures for a few seconds; without it a dead broker froze the dashboard and slowed re-registration.
+
+### Raft-style election (optional)
+
+`POLYGLOT_ELECTION=raft` replaces Bully with Raft's election rules: terms, at most one vote per broker per
+term, and leadership only with votes from a majority of all brokers. Two leaders can then never be elected in
+the same term, a broker cut off in a minority can never be elected, and a leader that cannot reach a majority
+for `POLYGLOT_HEARTBEAT_TIMEOUT` steps down and stops taking work, so the minority side of a network split goes
+quiet rather than translating into the void. Every message carries the term, and replication from an older
+term is ignored, so a deposed leader cannot overwrite the new one's work. The term and vote are kept on disk
+(`POLYGLOT_RAFT_STATE`, `/data/raft-{id}.json` on Docker) so a restarted broker cannot vote twice. The price is
+availability: with three brokers the relay survives one failure, not two (use five brokers for two). Only the
+election is Raft; jobs are still replicated as described below, not through a Raft log. Bully stays the default
+because it keeps a lone surviving broker working.
+
+### Jobs on disk
+
+Each broker keeps unfinished jobs in its own SQLite journal (`POLYGLOT_JOB_JOURNAL`, on by default in Docker at
+`/data/jobs-{id}.db`; empty turns it off). The leader writes a job when it hands it out and deletes it when it
+is finished or given up; standbys mirror the leader's journal through replication. A broker that starts loads
+what is left, so even if **every broker stops at once** the next leader delivers the unfinished jobs again
+(those younger than `POLYGLOT_JOB_JOURNAL_MAX_AGE`, default 600 s). Duplicates are ignored downstream.
 
 ### Delivery guarantees
 
@@ -177,6 +248,70 @@ Every translation job is delivered **at least once**, and a failure never costs 
 - A broker that finds itself demoted drops its clients, and a leader yields to a higher live broker, so a
   returning broker never leaves two leaders.
 
+## Security: the cluster secret
+
+Set `POLYGLOT_CLUSTER_SECRET` (the same value for every container; Compose passes it through) and every
+message on the relay's own TCP protocol carries a proof that the sender knows it: an HMAC-SHA256 over a
+timestamp, a one-time nonce and the message type. The secret itself never travels. A broker checks the first
+message of every connection and refuses anything missing, wrong, older than two minutes, or replayed; a
+worker does the same for caption listeners, which first send a short `subscribe`. So a process on the same
+network that does not know the secret cannot register as a worker, inject captions, read a language's stream
+or disrupt an election. It authenticates, it does not encrypt: keep the ports on a private network (or put the
+cluster behind a VPN/TLS tunnel) if the captions themselves are sensitive.
+
+## Translation context and glossary
+
+- **Context:** each sentence is sent with the one or two said just before it in the same room
+  (`POLYGLOT_CONTEXT_SENTENCES`, default 2, 0 = off). Gemini is told they are context only, to keep names,
+  pronouns, gender and tense consistent, and translates only the new sentence. LibreTranslate ignores it.
+  The translation cache ignores context on purpose, so a repeated phrase is still free.
+- **Glossary:** `POLYGLOT_GLOSSARY_FILE` names a JSON file of terms that must always be rendered the same
+  way (see `glossary.example.json`): `"UIT": "*"` keeps a name as written in every language,
+  `"broker": {"th": "..."}` fixes one language's rendering. Gemini is given the renderings of the terms in each
+  sentence; for LibreTranslate the terms are swapped for placeholders it leaves alone and put back afterwards
+  (and if it mangles a placeholder the sentence is translated plainly instead). The file is re-read when it
+  changes, so terms can be added during an event. In Docker, copy it into the project before building, or
+  mount it (`- ./glossary.json:/glossary.json:ro` on the workers) and set `POLYGLOT_GLOSSARY_FILE=/glossary.json`.
+
+## Speech-to-text: voice activity and invented fragments
+
+- **Voice activity:** the live microphone is cut at pauses, as before, with three refinements: a sound must
+  last about 100 ms to count as speech (a click or a knocked table does not open a slice); once speech has
+  started it keeps counting down to 60% of the threshold, so soft word endings are not taken for the pause;
+  and a reading counts as voice only when most of its energy is in the voice band (300-3400 Hz), so a fan,
+  hum or rumble is not sent for transcription.
+- **Invented fragments:** transcribers fill silence and music with stock phrases ("Thanks for watching!",
+  "Subtitles by the Amara.org community", Vietnamese "Hãy subscribe cho kênh Ghiền Mì Gõ…") or loop on a word.
+  `fragment_guard.py` drops a transcript that is *entirely* such a phrase, a courtesy like "Thank you" only
+  when the audio was quiet, and runaway repetition. Measured before use on FLEURS
+  (`python -m eval.fragment_guard_eval`, `results/fragment_guard.json`): of 3,597 real sentences (all 1,350
+  references and every Gemini and Whisper transcript, nine languages) it drops **none**, even treating every
+  one as quiet audio, and it catches all 22 fragments in the test list (the list it was written against, so
+  that figure shows coverage, not an independent measurement). `POLYGLOT_FRAGMENT_GUARD=0` turns it off.
+
+## Monitoring
+
+```bash
+docker compose -f compose.yaml -f compose.libretranslate.yaml -f compose.monitoring.yaml up -d
+```
+
+adds Prometheus (http://localhost:9090) and Grafana (http://localhost:3000, the **Polyglot Relay** dashboard
+opens without logging in). The dashboard serves everything at `/metrics` in Prometheus format: delay from
+speech to caption per language (a histogram), captions per minute, queue depth and jobs waiting for a worker,
+job outcomes counted by the leader (routed, completed, redelivered, replayed, failed), each worker's
+translations, failures and cache hits, which brokers are up and which leads, rooms, open push streams and
+speech calls. With a viewing token, Prometheus sends it as a bearer token (see `monitoring/prometheus.yml`).
+
+## Scaling worker pools
+
+Every worker advertises its own address (`--host auto`) and picks its own id, so any pool can run several
+copies: `docker compose ... up -d --scale worker-th=3`. The leader gives each job to the least-loaded copy.
+`tools/autoscale.py` does it automatically from `/metrics`: one more worker when a pool's backlog per worker
+stays above `--high` (default 3) for two readings, or at once when work waits for a language with no worker;
+one fewer after `--cooldown` seconds (default 60) without a backlog; always within `--min`..`--max`.
+`--dry-run` only prints what it would do. On this project's Windows machine, add `--clean-env` so the old
+`GEMINI_API_KEY` in the shell does not reach new containers.
+
 ## History
 
 The live caption cards show the latest 50 captions per language and keep their scroll position. The
@@ -187,10 +322,13 @@ you see as text, CSV (opens in Excel with Burmese, Thai and Khmer intact), JSON 
 data is available at `/api/history` and `/api/export` (`since`, `until`, `last_minutes`, `langs`, `q`,
 `limit`, `format`, `lang`). By default history is held in memory only: a restart or **Clear captions &
 history** empties it. Set `POLYGLOT_HISTORY_FILE` (the Compose stack mounts a volume at `/data`, so
-`/data/history.jsonl` works) to keep it across restarts: each update is appended as one JSON line, the file
-is compacted when it grows, a damaged line is skipped, and a disk error is logged once without stopping
-captions. **Clear captions & history** empties the file too. The file holds everything that was said, so
-treat it as private.
+`/data/history.db` works) to keep it in SQLite across restarts, one table for every room. Memory still holds
+the newest `POLYGLOT_HISTORY_CHUNKS` per room for the live view, while the database keeps up to
+`POLYGLOT_HISTORY_DB_ROWS` per room (default 100,000) and the History panel's time frames and search run
+against all of it. A history file from an earlier version (JSON lines, at the same path or as `history.jsonl`
+beside `history.db`) is imported once and kept as `.bak`. A disk error is logged once without stopping
+captions, and **Clear captions & history** empties the room in the database too. The file holds everything
+that was said, so treat it as private.
 
 ## Evaluating it
 
@@ -217,6 +355,12 @@ into one table.
 `asr` reports character and word error rate, empty outputs, seconds per clip and real-time factor;
 `mt` reports chrF++ against the human English translation. Both give 95% bootstrap intervals, and
 a clip that produced nothing scores as a total miss. chrF++ matches sacrebleu to 1e-14.
+To measure whether translation context or a glossary helps, run `mt` twice, with and without
+`--context 2` (or `--glossary FILE`), and compare: `python -m eval.compare_mt results/mt_plain.json
+results/mt_context.json` gives chrF++ per language for both runs and a paired-bootstrap 95% interval for the
+difference. (FLEURS sentences are ordered by sentence id, which keeps an article's sentences together.)
+COMET is not included: it needs a 2 GB neural model and PyTorch; chrF++ is computed exactly as sacrebleu does.
+
 `failover_trials` kills the leader N times and reports the distribution of time-to-new-leader
 (4.75 s, SD 0.02 s over 10 trials with the default 1 s heartbeat / 3 s timeout; the earlier 2 s / 6 s
 defaults took 8.12 s). `--brokers 3 --kills 2` kills the leader twice in a row (4.7 s, then 4.0 s).
@@ -228,8 +372,10 @@ python -m unittest discover -s tests -v
 ```
 
 or inside Docker: `docker compose --profile test run --rm tests`. The Docker image is stdlib-only, so
-tests that need numpy, the Gemini SDK or Node are skipped there (about 62 of 803); run the suite natively
-to execute everything.
+tests that need numpy, the Gemini SDK or Node are skipped there; run the suite natively to execute
+everything. **GitHub Actions** (`.github/workflows/ci.yml`) runs on every push: the Python and JavaScript
+suites, the suite inside the Docker test image, a smoke test and a short load test of a whole relay started
+with Compose (mock translators, `compose.ci.yaml`), and a chaos test.
 
 Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built-in runner
 (`node --test tests/js/*.test.js` on a shell that expands the pattern, or list the four files; they are also part of the Python run when `node` is installed).
@@ -247,6 +393,14 @@ Browser-side tests run the real `ui/app.js` against a fake DOM with Node's built
 | Dashboard page, listener page (logic and DOM), speech helper and live slicer (JavaScript) | `test_ui_app.py` + `tests/js/`, `test_live_slicer.py` |
 | Retry limits, shutdown, command-line entry points, English-pivot decision | `test_edges.py` |
 | The smoke-test tool, against stub relays and a real mock cluster | `test_smoke_tool.py` |
+| Rooms, SQLite history, push stream, translation context | `test_rooms_and_events.py` |
+| Glossary and context in the translator | `test_glossary.py` |
+| Cluster secret: signing, replay, brokers and workers refusing outsiders, a real cluster | `test_cluster_auth.py` |
+| Raft election (including a randomised split-brain check and a real 3-broker run) and the job journal | `test_raft_and_journal.py` |
+| Metrics, the /metrics page and the Grafana dashboard | `test_metrics.py` |
+| Read-aloud disk cache, voices and daily allowance | `test_speech_extras.py` |
+| Interim captions, the fragment guard and its FLEURS measurement | `test_interim.py`, `test_fragment_guard.py` |
+| Autoscaler, load test and chaos test tools (the load test also against a real relay) | `test_autoscale.py`, `test_load_and_chaos_tools.py` |
 | Rate gate, evaluation metrics, evaluation runner, failover trials | `test_gemini_rate_gate.py`, `test_gate_and_eval.py`, `test_evaluation.py`, `test_eval_harness.py` |
 
 ### Checking a running system
@@ -257,6 +411,12 @@ dashboard and listener pages are served, all nine translations come back, and th
 caption. It prints PASS/FAIL for each check and exits non-zero if any failed, so it can gate a deployment. Add
 `--speech` to also test read-aloud (it spends Gemini speech quota). The caption stays in the history until you
 use **Clear captions & history**.
+
+`python tools/load_test.py --rate 2 --count 120 --rooms 4` measures throughput and delay per language (median,
+95th percentile, worst) and lists anything that never arrived. `python tools/chaos_test.py --duration 120`
+does the same while killing a random broker or worker container every 15 s (and starting it again), and
+checks the relay's two promises: every caption arrives in every language, and there is never more than one
+leader; it also reports the longest time without a leader. Run it on a test stack: it really kills containers.
 
 To see coverage: `pip install coverage`, then
 `python -m coverage run --branch --source=. --omit="tests/*,tools/*" -m unittest discover -s tests`

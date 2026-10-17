@@ -108,6 +108,13 @@ class HistoryStoreTests(unittest.TestCase):
 
 
 class PersistedStateTests(unittest.TestCase):
+    def DashboardState(self):
+        """A dashboard state whose database is closed after the test (Windows cannot delete an open file)."""
+        state = DashboardState()
+        if state._store:
+            self.addCleanup(state._store.close)
+        return state
+
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
@@ -118,15 +125,15 @@ class PersistedStateTests(unittest.TestCase):
 
     def test_without_the_setting_nothing_is_written(self):
         with mock.patch.dict(os.environ, {"POLYGLOT_HISTORY_FILE": ""}):
-            state = DashboardState()
+            state = self.DashboardState()
             say(state, "a", "hello", th=THAI)
         self.assertFalse(os.path.exists(self.path))
 
     def test_what_was_said_survives_a_restart_and_numbering_continues(self):
-        state = DashboardState()
+        state = self.DashboardState()
         say(state, "a", "hello", th=THAI)
         say(state, "b", "again")
-        restarted = DashboardState()
+        restarted = self.DashboardState()
         found = restarted.query_history()["chunks"]
         self.assertEqual([row["text"] for row in found], ["hello", "again"])
         self.assertEqual(found[0]["translations"]["th"]["text"], THAI)
@@ -134,23 +141,23 @@ class PersistedStateTests(unittest.TestCase):
         self.assertEqual(restarted.history["c"]["number"], 3)
 
     def test_a_translation_that_arrives_later_is_saved_too(self):
-        state = DashboardState()
+        state = self.DashboardState()
         state.record_original("a", "hello", "en")
         state.add_caption({"lang": "th", "chunk_id": "a", "text": THAI, "timestamp": 1.0})
-        self.assertIn("th", DashboardState().history["a"]["translations"])
+        self.assertIn("th", self.DashboardState().history["a"]["translations"])
 
     def test_clearing_forgets_the_saved_history_too(self):
-        state = DashboardState()
+        state = self.DashboardState()
         say(state, "a", "hello")
         state.clear()
-        self.assertEqual(len(DashboardState().history), 0)
+        self.assertEqual(len(self.DashboardState().history), 0)
 
     def test_the_restored_history_obeys_the_row_limit(self):
         with mock.patch.dict(os.environ, {"POLYGLOT_HISTORY_CHUNKS": "10"}):
-            state = DashboardState()
+            state = self.DashboardState()
             for n in range(25):
                 say(state, f"c{n}", f"text {n}")
-            self.assertEqual(len(DashboardState().history), 10)
+            self.assertEqual(len(self.DashboardState().history), 10)
 
 
 class WebTestCase(unittest.TestCase):

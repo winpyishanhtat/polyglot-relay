@@ -21,7 +21,19 @@ class LiveSlicer {
     this.sendPeak = options.sendPeak ?? 0.02;        // a slice that never reached this is silence and is not sent
     this.noiseWindow = options.noiseWindow ?? 60;    // readings kept for the noise estimate (~3s at 50ms)
     this.noisePercentile = options.noisePercentile ?? 0.1; // the quietest tenth of them is taken as the room
+    // Voice activity, beyond loudness:
+    this.onsetFrames = options.onsetFrames ?? 2;     // speech must last this many readings (~100ms) to start:
+                                                     // a click, a cough or a knocked table does not open a slice
+    this.holdRatio = options.holdRatio ?? 0.6;       // once speech has started it keeps counting down to this
+                                                     // fraction of the threshold, so soft word endings are not
+                                                     // taken for a pause (hysteresis)
+    this.voiceRatioMin = options.voiceRatioMin ?? 0.35; // when the page measures it: the share of energy in the
+                                                     // voice band (300-3400 Hz) below which a sound is not a voice
+                                                     // (hum, rumble, hiss, a fan)
     this.recent = [];
+    this.above = 0;
+    this.inSpeech = false;
+    this.previous = 0;
     this.reset(0);
   }
 
@@ -59,14 +71,38 @@ class LiveSlicer {
     return this.heardSpeech || this.peak >= this.sendPeak;
   }
 
+  // Whether one reading is voice: loud enough (with hysteresis once speech has started), lasting long
+  // enough, and - when the page can tell - with its energy where a voice's is.
+  isVoice(rms, voiceRatio) {
+    const voiced = voiceRatio === undefined || voiceRatio === null || voiceRatio >= this.voiceRatioMin;
+    const level = this.inSpeech ? this.threshold() * this.holdRatio : this.threshold();
+    if (!voiced || rms <= level) {
+      this.above = 0;
+      this.inSpeech = false;
+      return false;
+    }
+    this.above += 1;
+    if (this.inSpeech || this.above >= this.onsetFrames) {
+      this.inSpeech = true;
+      return true;
+    }
+    return false;
+  }
+
   // Feed one reading. Returns {cut, reason, hadSpeech}: when cut is true the
   // current slice should end now (and hadSpeech says whether it is worth
   // sending); the caller then keeps going, as a new slice has already begun.
-  push(rms, nowMs) {
+  // voiceRatio (optional, 0..1) is the share of the reading's energy in the voice band.
+  push(rms, nowMs, voiceRatio) {
     this.recent.push(rms);
     if (this.recent.length > this.noiseWindow) this.recent.shift();
-    this.peak = Math.max(this.peak, rms);
-    if (rms > this.threshold()) {
+    if (voiceRatio === undefined || voiceRatio === null || voiceRatio >= this.voiceRatioMin) {
+      // The quieter of two readings in a row: a sound must last to count, so a lone click is not a reason
+      // to send a slice (and neither is a loud hum, above).
+      this.peak = Math.max(this.peak, Math.min(rms, this.previous));
+    }
+    this.previous = rms;
+    if (this.isVoice(rms, voiceRatio)) {
       this.heardSpeech = true;
       this.lastSpeechAt = nowMs;
     }

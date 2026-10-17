@@ -10,6 +10,7 @@ import logging
 import os
 import pathlib
 import queue
+import re
 import socket
 import tempfile
 import threading
@@ -22,11 +23,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import history as caption_history
+import metrics
 import tts
 from common import config
 from common import netutil
 from common.discovery import discover_worker
-from common.protocol import ProtocolError, decode_stream, encode, recv_one
+from common.protocol import ProtocolError, cluster_secret, decode_stream, encode, recv_one
 from stt_service import DEMO_SENTENCES, TranscriptProducer, _load_whisper, gemini_first, transcribe_file
 from translator_worker import _LIBRETRANSLATE_NEVER_SUPPORTS as PIVOT_SOURCES
 from translator_worker import Translator
@@ -39,6 +41,10 @@ STATIC_DIR = pathlib.Path(__file__).resolve().parent / "ui"
 WHISPER_MODEL = os.getenv("POLYGLOT_WHISPER_MODEL", "base")
 MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_LIVE_SLICE_BYTES = 2 * 1024 * 1024
+# A browser's push connection (/api/events) is closed after this long and the browser reconnects by itself,
+# carrying on from the last event it saw; a keep-alive comment goes out when nothing has happened for a while.
+EVENTS_MAX_SECONDS = 300.0
+EVENTS_KEEPALIVE_SECONDS = 15.0
 # Slices waiting for the transcriber. Deliberately small: in a live session a
 # caption that arrives half a minute late is worse than a skipped slice.
 LIVE_QUEUE_SLICES = 3
@@ -63,6 +69,13 @@ def live_slicing_settings() -> dict[str, int]:
     max_seconds = max(number("POLYGLOT_LIVE_MAX_SLICE_SECONDS", 8, 4, 15), min_seconds + 1)
     return {"min_ms": int(min_seconds * 1000), "max_ms": int(max_seconds * 1000),
             "pause_ms": int(number("POLYGLOT_LIVE_PAUSE_MS", 350, 150, 1000))}
+
+
+def interim_enabled() -> bool:
+    """Words while the speaker is still talking (POLYGLOT_INTERIM=1): the page sends the phrase so far every
+    couple of seconds and the transcript is pushed to the room as an "interim" event. Off by default because
+    each interim costs a transcription (a Gemini call for Burmese, Khmer, Lao and anything Gemini-first)."""
+    return (os.getenv("POLYGLOT_INTERIM") or "0") == "1"
 
 
 def access_token() -> str:
@@ -115,8 +128,53 @@ class LiveBacklogError(Exception):
     """The live transcriber is saturated; the caller should skip, not retry."""
 
 
+# ---- rooms ----------------------------------------------------------------------------------------
+# Each room is its own audience: its own captions, history, chunk table and live counters, sharing the one
+# relay network. The room travels in the chunk id ("<room>~ui-..."), so captions coming back from the workers
+# find their room without the brokers or workers knowing rooms exist. The default room keeps the plain
+# "ui-..." ids so older clients, history and tests are unchanged.
+DEFAULT_ROOM = "main"
+ROOM_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+ROOM_SEPARATOR = "~"
+
+
+def max_rooms() -> int:
+    return max(1, int(os.getenv("POLYGLOT_MAX_ROOMS") or "20"))
+
+
+def room_name(raw: str | None) -> str:
+    """A valid room name, or ValueError. Empty means the default room."""
+    name = (raw or DEFAULT_ROOM).strip().lower()
+    if not ROOM_PATTERN.match(name):
+        raise ValueError("A room name is 1-32 lowercase letters, digits or dashes, starting with a letter or digit")
+    return name
+
+
+def room_of_chunk(chunk_id: str | None) -> str:
+    if chunk_id and ROOM_SEPARATOR in chunk_id:
+        candidate = chunk_id.split(ROOM_SEPARATOR, 1)[0]
+        if ROOM_PATTERN.match(candidate):
+            return candidate
+    return DEFAULT_ROOM
+
+
+_STORE_FROM_ENV = object()
+
+
+def _room_arg(room: str) -> dict[str, str]:
+    """{"room": name} except for the default room, so calls for it keep their old shape."""
+    return {} if room == DEFAULT_ROOM else {"room": room}
+
+
+def _with_context(context: list[str] | None) -> dict[str, Any]:
+    return {"context": context} if context else {}
+
+
 class DashboardState:
-    def __init__(self) -> None:
+    FEED_EVENTS = 500
+
+    def __init__(self, room: str = DEFAULT_ROOM, store: Any = _STORE_FROM_ENV) -> None:
+        self.room = room
         self.started_at = time.time()
         self.captions = {lang: deque(maxlen=50) for lang in config.TARGET_LANGUAGES}
         self.workers = {lang: {"connected": False, "worker_id": None} for lang in config.TARGET_LANGUAGES}
@@ -140,24 +198,49 @@ class DashboardState:
         self._history_max = max(10, int(os.getenv("POLYGLOT_HISTORY_CHUNKS") or "2000"))
         self._history_max_age = max(0.0, float(os.getenv("POLYGLOT_HISTORY_MINUTES") or "0")) * 60
         self._lock = threading.RLock()
-        # Optional: keep the history on disk so a restart does not lose it (POLYGLOT_HISTORY_FILE).
-        history_file = os.getenv("POLYGLOT_HISTORY_FILE") or ""
-        self._store = caption_history.HistoryStore(history_file, self._history_max, LOG) if history_file else None
+        # Pushed to browsers over /api/events: every change gets the next number, so a reconnecting browser
+        # can ask for what it missed (Last-Event-ID) instead of reloading everything.
+        self.feed: deque[tuple[int, str, Any]] = deque(maxlen=self.FEED_EVENTS)
+        self.feed_seq = 0
+        self._feed_changed = threading.Condition(self._lock)
+        # Optional: keep the history on disk so a restart does not lose it (POLYGLOT_HISTORY_FILE, SQLite).
+        if store is _STORE_FROM_ENV:
+            history_file = os.getenv("POLYGLOT_HISTORY_FILE") or ""
+            store = caption_history.open_history(history_file, LOG) if history_file else None
+        self._store = store
         if self._store:
-            self.history = self._store.load()
+            self.history = self._store.load(self.room, self._history_max)
             self._trim_history(time.time())
             self.sequence = max((row.get("number") or 0 for row in self.history.values()), default=0)
             if self.history:
-                LOG.info("Restored %d captions from %s", len(self.history), history_file)
+                LOG.info("Restored %d captions for room %s", len(self.history), self.room)
 
     def _persist(self, chunk_id: str) -> None:
         row = self.history.get(chunk_id)
         if self._store and row is not None:
-            self._store.save(row, self.history.values())
+            self._store.save(self.room, row)
+
+    def publish(self, kind: str, data: Any) -> None:
+        with self._feed_changed:
+            self.feed_seq += 1
+            self.feed.append((self.feed_seq, kind, data))
+            self._feed_changed.notify_all()
+
+    def events_after(self, after: int, timeout: float = 0.0) -> list[tuple[int, str, Any]]:
+        """Events newer than `after`, waiting up to `timeout` seconds for one. If `after` is older than the
+        feed remembers, a single "reload" event says to fetch everything again."""
+        with self._feed_changed:
+            if self.feed_seq <= after and timeout > 0:
+                self._feed_changed.wait_for(lambda: self.feed_seq > after, timeout)
+            if after < self.feed_seq and self.feed and self.feed[0][0] > after + 1:
+                return [(self.feed_seq, "reload", {})]
+            return [entry for entry in self.feed if entry[0] > after]
 
     def event(self, message: str, kind: str = "info") -> None:
         with self._lock:
-            self.activity.appendleft({"message": message, "kind": kind, "timestamp": time.time()})
+            item = {"message": message, "kind": kind, "timestamp": time.time()}
+            self.activity.appendleft(item)
+            self.publish("activity", item)
 
     def record_original(self, chunk_id: str, text: str, source_lang: str | None) -> None:
         with self._lock:
@@ -177,6 +260,8 @@ class DashboardState:
                 "text": text, "source_lang": source_lang, "created_at": now,
                 "targets": {lang: {"status": "source" if lang == source_lang else "awaiting_broker"}
                             for lang in config.TARGET_LANGUAGES}}
+            self.publish("chunk", json.loads(json.dumps(row)))
+            metrics.REGISTRY.inc("polyglot_chunks_total", room=self.room)
 
     def _history_row(self, chunk_id: str, created_at: float) -> dict:
         row = self.history.get(chunk_id)
@@ -206,9 +291,11 @@ class DashboardState:
             since = now - last_minutes * 60
         wanted = [code for code in (langs or config.TARGET_LANGUAGES) if code in config.LANGUAGES]
         needle = (query or "").strip().casefold()
+        # With a database the whole stored history is searched, not only what memory still holds.
+        stored = self._store.query(self.room, since, until) if self._store else None
         with self._lock:
             matching = []
-            for row in self.history.values():
+            for row in (stored if stored is not None else self.history.values()):
                 if (since is not None and row["created_at"] < since) or (until is not None and row["created_at"] > until):
                     continue
                 shown = {code: dict(row["translations"][code]) for code in wanted if code in row["translations"]}
@@ -220,8 +307,10 @@ class DashboardState:
             matching.sort(key=lambda r: (r["created_at"], r["number"] or 0))
             total = len(matching)
             kept = matching[-limit:] if limit and total > limit else matching
+            retained = self._store.count(self.room) if self._store else len(self.history)
+            max_retained = self._store.max_rows if self._store else self._history_max
             return {"chunks": kept, "total": total, "returned": len(kept), "truncated": total > len(kept),
-                    "retained": len(self.history), "max_retained": self._history_max, "server_time": now}
+                    "retained": retained, "max_retained": max_retained, "server_time": now, "room": self.room}
 
     def add_caption(self, message: dict[str, Any]) -> None:
         lang = str(message["lang"])
@@ -242,6 +331,11 @@ class DashboardState:
                                              "timestamp": float(message.get("timestamp", time.time()))}
                 self._trim_history(time.time())
                 self._persist(chunk_id)
+                self.publish("caption", {"lang": lang, "row": json.loads(json.dumps(row))})
+                backend = str(message.get("translation_backend", "relay"))
+                metrics.REGISTRY.inc("polyglot_captions_total", room=self.room, lang=lang, backend=backend)
+                if row.get("number") and backend != "passthrough" and message.get("worker_id") != "source":
+                    metrics.REGISTRY.observe("polyglot_caption_delay_seconds", max(0.0, time.time() - row["created_at"]), lang=lang)
             self.captions[lang].appendleft({
                 "chunk_id": chunk_id,
                 "text": str(message.get("text", "")),
@@ -258,6 +352,8 @@ class DashboardState:
         with self._lock:
             before = self.workers[lang]["connected"]
             self.workers[lang] = {"connected": connected, "worker_id": worker_id if connected else None}
+            if before != connected:
+                self.publish("workers", {lang: dict(self.workers[lang])})
         if before != connected:
             self.event(f"{lang.upper()} listener {'connected' if connected else 'reconnecting'}",
                        "success" if connected else "warning")
@@ -268,7 +364,8 @@ class DashboardState:
                 captions.clear()
             self.history.clear()
             if self._store:
-                self._store.wipe()
+                self._store.wipe(self.room)
+            self.publish("clear", {})
         self.event("Caption history cleared")
 
     def snapshot(self) -> dict[str, Any]:
@@ -287,7 +384,14 @@ class DashboardState:
 
 class DashboardRuntime:
     def __init__(self) -> None:
-        self.state = DashboardState()
+        history_file = os.getenv("POLYGLOT_HISTORY_FILE") or ""
+        self.store = caption_history.open_history(history_file, LOG) if history_file else None
+        self.rooms: dict[str, DashboardState] = {}
+        self._rooms_lock = threading.Lock()
+        self.state = self.room(DEFAULT_ROOM)
+        for name in (self.store.rooms() if self.store else []):      # rooms with saved history come back too
+            if ROOM_PATTERN.match(name) and len(self.rooms) < max_rooms():
+                self.room(name)
         self.stop_event = threading.Event()
         self.outbox: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=100)
         self.live_queue: queue.Queue[tuple[int, bytes, str]] = queue.Queue(maxsize=LIVE_QUEUE_SLICES)
@@ -305,9 +409,41 @@ class DashboardRuntime:
         self._live_done: dict[int, list[tuple[str, str | None]]] = {}
         self._live_started: dict[int, float] = {}
         self._live_late: set[int] = set()
+        self._live_rooms: dict[int, str] = {}      # which room each live slice belongs to
+        self._interim_lock = threading.Lock()       # one interim transcription at a time; extras are skipped
         self.producer = TranscriptProducer()
         self._media_lock = threading.Lock()
         self._last_leader = None
+
+    def room(self, name: str | None = None, create: bool = True) -> DashboardState:
+        """The state of a room, created on first use (up to POLYGLOT_MAX_ROOMS). ValueError for a bad name."""
+        name = room_name(name)
+        with self._rooms_lock:
+            state = self.rooms.get(name)
+            if state is None:
+                if not create:
+                    raise ValueError(f"There is no room called {name!r}")
+                if len(self.rooms) >= max_rooms():
+                    raise ValueError(f"The relay already has {max_rooms()} rooms; reuse one or raise POLYGLOT_MAX_ROOMS")
+                state = DashboardState(name, self.store)
+                for lang, worker in (self.rooms[DEFAULT_ROOM].workers.items() if DEFAULT_ROOM in self.rooms else ()):
+                    state.workers[lang] = dict(worker)
+                self.rooms[name] = state
+            return state
+
+    def _room_or_main(self, name: str | None) -> DashboardState:
+        try:
+            return self.room(name)
+        except ValueError:          # too many rooms: still show it rather than lose it
+            return self.state
+
+    def room_for_chunk(self, chunk_id: str | None) -> DashboardState:
+        return self._room_or_main(room_of_chunk(chunk_id))
+
+    def room_list(self) -> list[dict[str, Any]]:
+        with self._rooms_lock:
+            states = list(self.rooms.values())
+        return [{"room": state.room, "captions": len(state.history), "created_at": state.started_at} for state in states]
 
     def start(self) -> None:
         for lang in config.TARGET_LANGUAGES:
@@ -327,7 +463,8 @@ class DashboardRuntime:
         except (Exception, SystemExit) as exc:
             LOG.info("Whisper not preloaded (%s)", exc)
 
-    def submit(self, text: str, source_lang: str | None = None) -> None:
+    def submit(self, text: str, source_lang: str | None = None, room: str = DEFAULT_ROOM) -> None:
+        state = self.room(room)
         cleaned = " ".join(text.strip().split())
         if not cleaned:
             raise ValueError("Caption text cannot be empty")
@@ -335,14 +472,14 @@ class DashboardRuntime:
             raise ValueError("Caption text must be 2,000 characters or fewer")
         if source_lang and source_lang != "auto" and source_lang not in config.LANGUAGES:
             raise ValueError(f"Unknown source language {source_lang!r}")
-        with self.state._lock:
+        with state._lock:
             active = sum(any(t["status"] not in ("source", "completed", "failed", "unavailable", "interrupted")
-                             for t in c["targets"].values()) for c in self.state.chunks.values())
-            if active + self.state.pending >= 100:
+                             for t in c["targets"].values()) for c in state.chunks.values())
+            if active + state.pending >= 100:
                 raise ValueError("100 chunks are still processing. Wait for translations before submitting more.")
-            self.state.pending += 1
-        self.outbox.put((cleaned, source_lang))
-        self.state.event("Caption queued for translation")
+            state.pending += 1
+        self.outbox.put((cleaned, source_lang) if state.room == DEFAULT_ROOM else (cleaned, source_lang, state.room))
+        state.event("Caption queued for translation")
 
     def _transcribe_blob(self, data: bytes, source_lang: str | None, on_unrecognized=None):
         """Yield (text, effective source language) for each speech window of an
@@ -379,7 +516,7 @@ class DashboardRuntime:
         finally:
             tmp_path.unlink(missing_ok=True)
 
-    def submit_audio(self, data: bytes, source_lang: str | None = None) -> tuple[int, str | None]:
+    def submit_audio(self, data: bytes, source_lang: str | None = None, room: str = DEFAULT_ROOM) -> tuple[int, str | None]:
         """Transcribe an uploaded/recorded audio-or-video blob with Whisper,
         in-process, and queue each resulting chunk exactly like submit().
         Returns (chunk count, the language Whisper actually detected - only
@@ -398,6 +535,7 @@ class DashboardRuntime:
             raise ValueError("Uploaded audio/video is empty")
         if source_lang and source_lang != "auto" and source_lang not in config.LANGUAGES:
             raise ValueError("Select one of the nine supported source languages")
+        state = self.room(room)
         gaps = 0
 
         def note_gap() -> None:
@@ -411,13 +549,13 @@ class DashboardRuntime:
                 if (detected_summary is None and (not source_lang or source_lang == "auto")
                         and effective_source_lang != source_lang):
                     detected_summary = effective_source_lang
-                self.submit(text, effective_source_lang)
+                self.submit(text, effective_source_lang, **_room_arg(state.room))
                 count += 1
-                with self.state._lock:
-                    self.state.media.update(chunks=count)
-                self.state.event(f"Audio chunk {count} transcribed and queued", "success")
+                with state._lock:
+                    state.media.update(chunks=count)
+                state.event(f"Audio chunk {count} transcribed and queued", "success")
             if gaps:
-                self.state.event(f"{gaps} audio window(s) could not be transcribed because Gemini was "
+                state.event(f"{gaps} audio window(s) could not be transcribed because Gemini was "
                                  "unavailable; those parts are missing", "warning")
             if not count:
                 if gaps:
@@ -429,28 +567,29 @@ class DashboardRuntime:
         except Exception as exc:
             raise ValueError(f"Could not transcribe upload: {exc}") from exc
 
-    def start_audio(self, data: bytes, source_lang: str | None) -> None:
+    def start_audio(self, data: bytes, source_lang: str | None, room: str = DEFAULT_ROOM) -> None:
         if not data or source_lang not in config.LANGUAGES:
             raise ValueError("Select a source language and provide an audio/video file")
+        state = self.room(room)
         if not self._media_lock.acquire(blocking=False):
             raise ValueError("An upload is already being transcribed; wait for it to finish")
-        with self.state._lock:
-            self.state.media = {"status": "transcribing", "chunks": 0, "source_lang": source_lang}
+        with state._lock:
+            state.media = {"status": "transcribing", "chunks": 0, "source_lang": source_lang}
         def process():
             try:
-                count, _ = self.submit_audio(data, source_lang)
-                with self.state._lock:
-                    self.state.media.update(status="transcribed", chunks=count)
-                self.state.event("Transcription finished; language pools continue processing", "success")
+                count, _ = self.submit_audio(data, source_lang, **_room_arg(state.room))
+                with state._lock:
+                    state.media.update(status="transcribed", chunks=count)
+                state.event("Transcription finished; language pools continue processing", "success")
             except Exception as exc:
-                with self.state._lock:
-                    self.state.media.update(status="failed", error=str(exc))
-                self.state.event(str(exc), "error")
+                with state._lock:
+                    state.media.update(status="failed", error=str(exc))
+                state.event(str(exc), "error")
             finally:
                 self._media_lock.release()
         threading.Thread(target=process, name="upload-transcriber", daemon=True).start()
 
-    def enqueue_live_slice(self, data: bytes, source_lang: str | None) -> int:
+    def enqueue_live_slice(self, data: bytes, source_lang: str | None, room: str = DEFAULT_ROOM) -> int:
         """Accept one self-contained audio slice from a live browser session.
 
         Returns immediately (the browser must not wait on transcription). If
@@ -461,18 +600,45 @@ class DashboardRuntime:
             raise ValueError("Live audio slice is empty")
         if source_lang not in config.LANGUAGES:
             raise ValueError("Select the spoken language before going live")
+        state = self.room(room)
         with self._live_lock:
             try:
                 self.live_queue.put_nowait((self._live_seq, data, source_lang))
             except queue.Full:
-                with self.state._lock:
-                    self.state.live["dropped"] += 1
-                self.state.event("Live transcription is behind; a slice was skipped", "warning")
+                with state._lock:
+                    state.live["dropped"] += 1
+                state.event("Live transcription is behind; a slice was skipped", "warning")
                 raise LiveBacklogError("Transcriber is behind; slice skipped") from None
+            self._live_rooms[self._live_seq] = state.room
             self._live_seq += 1  # only consumed by slices that were actually queued
-        with self.state._lock:
-            self.state.live["queued"] = self.live_queue.qsize()
+        with state._lock:
+            state.live["queued"] = self.live_queue.qsize()
         return self.live_queue.qsize()
+
+    def interim(self, data: bytes, source_lang: str | None, room: str = DEFAULT_ROOM) -> None:
+        """Transcribe the phrase heard so far and push it to the room; never queued, never translated, never
+        kept. Finished slices come first: while they wait, or another interim is running, this one is skipped."""
+        if not interim_enabled():
+            raise ValueError("Interim captions are switched off (POLYGLOT_INTERIM=1 turns them on)")
+        if not data:
+            raise ValueError("Interim audio is empty")
+        if source_lang not in config.LANGUAGES:
+            raise ValueError("Select the spoken language before going live")
+        state = self.room(room)
+        if not self.live_queue.empty() or not self._interim_lock.acquire(blocking=False):
+            raise LiveBacklogError("Busy with finished speech; interim skipped")
+
+        def run() -> None:
+            try:
+                pieces = [text for text, _lang in self._transcribe_blob(data, source_lang)]
+                text = " ".join(pieces).strip()
+                if text:
+                    state.publish("interim", {"text": text, "lang": source_lang, "at": time.time()})
+            except (Exception, SystemExit) as exc:
+                LOG.info("Interim transcription failed: %s", exc)
+            finally:
+                self._interim_lock.release()
+        threading.Thread(target=run, name="interim", daemon=True).start()
 
     def start_live_workers(self, count: int | None = None) -> None:
         for index in range(count or LIVE_WORKERS):
@@ -523,17 +689,18 @@ class DashboardRuntime:
             head = self._live_next
             if head in self._live_done:
                 self._live_next += 1
+                state = self._room_or_main(self._live_rooms.pop(head, DEFAULT_ROOM))
                 submitted = 0
                 for text, lang in self._live_done.pop(head):
                     try:
-                        self.submit(text, lang)
+                        self.submit(text, lang, **_room_arg(state.room))
                         submitted += 1
                     except ValueError as exc:
-                        self.state.event(f"Live caption not sent: {exc}", "warning")
-                with self.state._lock:
-                    self.state.live["slices"] += 1
-                    self.state.live["chunks"] += submitted
-                    self.state.live["last_slice_at"] = time.time()
+                        state.event(f"Live caption not sent: {exc}", "warning")
+                with state._lock:
+                    state.live["slices"] += 1
+                    state.live["chunks"] += submitted
+                    state.live["last_slice_at"] = time.time()
             elif (head in self._live_started and any(seq > head for seq in self._live_done)
                   and time.monotonic() - self._live_started[head] > LIVE_MAX_HOLD_SECONDS):
                 # Later slices are waiting on this one and it has taken too
@@ -541,43 +708,59 @@ class DashboardRuntime:
                 self._live_started.pop(head)
                 self._live_late.add(head)
                 self._live_next += 1
-                with self.state._lock:
-                    self.state.live["late"] += 1
-                self.state.event("A live slice took too long and was skipped", "warning")
+                state = self._room_or_main(self._live_rooms.pop(head, DEFAULT_ROOM))
+                with state._lock:
+                    state.live["late"] += 1
+                state.event("A live slice took too long and was skipped", "warning")
             else:
                 return
 
-    def run_demo(self) -> None:
+    def run_demo(self, room: str = DEFAULT_ROOM) -> None:
+        state = self.room(room)
         for sentence in DEMO_SENTENCES:
-            self.submit(sentence, source_lang="en")
-        self.state.event("Four-caption demo queued", "success")
+            self.submit(sentence, source_lang="en", **_room_arg(state.room))
+        state.event("Four-caption demo queued", "success")
 
     def _send_loop(self) -> None:
         sequence = 0
         while not self.stop_event.is_set():
             try:
-                text, source_lang = self.outbox.get(timeout=0.5)
+                text, source_lang, *rest = self.outbox.get(timeout=0.5)
             except queue.Empty:
                 continue
             sequence += 1
+            state = self._room_or_main(rest[0]) if rest else self.state
             try:
                 chunk_id = f"ui-{int(time.time() * 1000)}-{sequence}"
-                self.state.record_original(chunk_id, text, source_lang)
+                if state.room != DEFAULT_ROOM:
+                    chunk_id = f"{state.room}{ROOM_SEPARATOR}{chunk_id}"
+                state.record_original(chunk_id, text, source_lang)
                 if source_lang in config.LANGUAGES:
-                    self.state.add_caption({"lang": source_lang, "chunk_id": chunk_id,
+                    state.add_caption({"lang": source_lang, "chunk_id": chunk_id,
                         "text": text, "translation_backend": "passthrough", "worker_id": "source"})
+                context = self._context_for(state, chunk_id)
                 if self._pivot_applies(source_lang):
-                    self._send_in_two_stages(text, chunk_id, source_lang)
+                    self._send_in_two_stages(text, chunk_id, source_lang, **_with_context(context))
                 else:
-                    self.producer.send(text, chunk_id, source_lang=source_lang)
-                self.state.event("Caption sent to the leader broker", "success")
+                    self.producer.send(text, chunk_id, source_lang=source_lang, **_with_context(context))
+                state.event("Caption sent to the leader broker", "success")
             except Exception as exc:
                 LOG.exception("Caption submission failed")
-                self.state.event(f"Caption failed: {exc}", "error")
+                state.event(f"Caption failed: {exc}", "error")
             finally:
-                with self.state._lock:
-                    self.state.pending = max(0, self.state.pending - 1)
+                with state._lock:
+                    state.pending = max(0, state.pending - 1)
                 self.outbox.task_done()
+
+    def _context_for(self, state: DashboardState, chunk_id: str) -> list[str] | None:
+        """The sentences said just before this one in the same room, oldest first, so the translator can keep
+        names, pronouns and tense consistent. POLYGLOT_CONTEXT_SENTENCES (default 2, 0 = off)."""
+        keep = max(0, int(os.getenv("POLYGLOT_CONTEXT_SENTENCES") or "2"))
+        if not keep:
+            return None
+        with state._lock:
+            earlier = [row["text"] for cid, row in state.history.items() if cid != chunk_id and row.get("text")]
+        return earlier[-keep:] or None
 
     def _cluster_is_real(self) -> bool:
         """True when the English pool runs a real backend, not --mock. Cached
@@ -605,7 +788,7 @@ class DashboardRuntime:
         except Exception:  # an unreachable broker must not break sending
             return False
 
-    def _send_in_two_stages(self, text: str, chunk_id: str, source_lang: str) -> None:
+    def _send_in_two_stages(self, text: str, chunk_id: str, source_lang: str, context: list[str] | None = None) -> None:
         """Send a Burmese/Khmer/Lao caption without making anyone wait for the pivot.
 
         LibreTranslate cannot read these languages, so every worker used to
@@ -618,15 +801,16 @@ class DashboardRuntime:
         directly, exactly as before."""
         gemini_only = sorted(PIVOT_SOURCES)
         covered = [lang for lang in config.TARGET_LANGUAGES if lang not in PIVOT_SOURCES]
-        self.producer.send(text, chunk_id, source_lang=source_lang, targets=gemini_only)
+        self.producer.send(text, chunk_id, source_lang=source_lang, targets=gemini_only, **_with_context(context))
+        state = self.room_for_chunk(chunk_id)
 
         def finish() -> None:
             try:
                 pivot = self._pivot_to_english(text, source_lang)
-                self.producer.send(text, chunk_id, source_lang=source_lang, pivot_en=pivot, targets=covered)
+                self.producer.send(text, chunk_id, source_lang=source_lang, pivot_en=pivot, targets=covered, **_with_context(context))
             except Exception as exc:
                 LOG.exception("Second stage of a chunk failed")
-                self.state.event(f"Caption partly failed: {exc}", "error")
+                state.event(f"Caption partly failed: {exc}", "error")
 
         threading.Thread(target=finish, name="pivot-stage-two", daemon=True).start()
 
@@ -650,20 +834,28 @@ class DashboardRuntime:
         while not self.stop_event.is_set():
             endpoint = discover_worker(lang)
             if not endpoint:
-                self.state.worker_status(lang, False)
+                self._worker_status(lang, False)
                 self.stop_event.wait(config.RECONNECT_DELAY)
                 continue
             try:
                 with netutil.connect(endpoint["host"], endpoint["port"], config.CONNECT_TIMEOUT) as sock:
                     sock.settimeout(None)
-                    self.state.worker_status(lang, True, str(endpoint["worker_id"]))
+                    if cluster_secret():          # a worker with a cluster secret wants proof first
+                        sock.sendall(encode({"type": "subscribe", "lang": lang, "sender_id": "dashboard"}))
+                    self._worker_status(lang, True, str(endpoint["worker_id"]))
                     for message in decode_stream(sock):
                         if message["type"] == "translated_chunk":
-                            self.state.add_caption(message)
+                            self.room_for_chunk(message.get("chunk_id")).add_caption(message)
             except (OSError, ConnectionError, ProtocolError) as exc:
                 LOG.debug("%s listener reconnecting: %s", lang, exc)
-            self.state.worker_status(lang, False)
+            self._worker_status(lang, False)
             self.stop_event.wait(config.RECONNECT_DELAY)
+
+    def _worker_status(self, lang: str, connected: bool, worker_id: str | None = None) -> None:
+        with self._rooms_lock:
+            states = list(self.rooms.values())
+        for state in states:
+            state.worker_status(lang, connected, worker_id)
 
     def broker_status(self) -> list[dict[str, Any]]:
         statuses = []
@@ -682,31 +874,84 @@ class DashboardRuntime:
             statuses.append(status)
         return statuses
 
-    def status(self) -> dict:
+    def status(self, room: str = DEFAULT_ROOM) -> dict:
+        state = self.room(room)
         brokers = self.broker_status()
         leader = next((b for b in brokers if b["online"] and b["leader"]), None)
-        with self.state._lock:
-            if leader and self._last_leader is not None and leader["id"] != self._last_leader:
-                for chunk in self.state.chunks.values():
-                    for target in chunk["targets"].values():
-                        if target["status"] not in ("completed", "source", "failed", "unavailable"):
-                            target.update(status="interrupted", detail="Leader changed; resubmit this text if no result arrives")
-                self.state.event(f"Leader changed to broker {leader['id']}; check interrupted chunks", "warning")
-            if leader:
-                self._last_leader = leader["id"]
-            for job in (leader or {}).get("jobs", []):
-                chunk = self.state.chunks.get(job["chunk_id"])
-                if chunk and job["lang"] in chunk["targets"]:
-                    current = chunk["targets"][job["lang"]]
-                    if current["status"] not in ("completed", "source"):
-                        chunk["targets"][job["lang"]] = dict(job)
-            snapshot = self.state.snapshot()
+        with self._rooms_lock:
+            states = list(self.rooms.values())
+        changed = bool(leader and self._last_leader is not None and leader["id"] != self._last_leader)
+        if leader:
+            self._last_leader = leader["id"]
+        for each in states:
+            with each._lock:
+                if changed:
+                    for chunk in each.chunks.values():
+                        for target in chunk["targets"].values():
+                            if target["status"] not in ("completed", "source", "failed", "unavailable"):
+                                target.update(status="interrupted", detail="Leader changed; resubmit this text if no result arrives")
+                    each.event(f"Leader changed to broker {leader['id']}; check interrupted chunks", "warning")
+                for job in (leader or {}).get("jobs", []):
+                    chunk = each.chunks.get(job["chunk_id"])
+                    if chunk and job["lang"] in chunk["targets"]:
+                        current = chunk["targets"][job["lang"]]
+                        if current["status"] not in ("completed", "source"):
+                            chunk["targets"][job["lang"]] = dict(job)
+        snapshot = state.snapshot()
+        snapshot["room"] = state.room
         snapshot["brokers"] = brokers
         snapshot["settings"] = {"tier": os.getenv("GEMINI_TIER", "free"),
             "chunk_seconds": float(os.getenv("POLYGLOT_FILE_CHUNK_SECONDS", "15")),
             "live_slicing": live_slicing_settings(),
+            "interim": interim_enabled(),
             "rpm": int(os.getenv("GEMINI_RATE_LIMIT_PER_MINUTE", "5"))}
         return snapshot
+
+    def metrics_lines(self, open_streams: int = 0) -> list[str]:
+        """Everything Prometheus scrapes: the dashboard's own counters and caption delays, the brokers' state
+        and the leader's job counters, each worker's translations and cache hits, rooms, streams and speech."""
+        lines = metrics.REGISTRY.render()
+        brokers = self.broker_status()
+        metrics.gauge(lines, "polyglot_broker_up", "1 when the broker answers", [({"broker": str(b["id"])}, 1 if b["online"] else 0) for b in brokers])
+        metrics.gauge(lines, "polyglot_broker_is_leader", "1 for the broker that currently leads",
+                      [({"broker": str(b["id"])}, 1 if b["online"] and b["leader"] else 0) for b in brokers])
+        leader = next((b for b in brokers if b["online"] and b["leader"]), None)
+        metrics.gauge(lines, "polyglot_leader_count", "How many brokers claim to lead (should be 1)",
+                      [({}, sum(1 for b in brokers if b["online"] and b["leader"]))])
+        members = (leader or {}).get("members", [])
+        workers: dict[str, int] = {}
+        queues: dict[str, int] = {}
+        for member in members:
+            workers[member["lang"]] = workers.get(member["lang"], 0) + 1
+            queues[member["lang"]] = queues.get(member["lang"], 0) + int(member.get("queue", 0))
+        metrics.gauge(lines, "polyglot_workers", "Connected translation workers per language",
+                      [({"lang": lang}, workers.get(lang, 0)) for lang in config.TARGET_LANGUAGES])
+        metrics.gauge(lines, "polyglot_queue_depth", "Jobs handed to a language's workers and not yet finished",
+                      [({"lang": lang}, queues.get(lang, 0)) for lang in config.TARGET_LANGUAGES])
+        waiting = (leader or {}).get("waiting", {})
+        metrics.gauge(lines, "polyglot_waiting_jobs", "Jobs held because the language has no worker",
+                      [({"lang": lang}, int(waiting.get(lang, 0))) for lang in config.TARGET_LANGUAGES])
+        if leader:
+            metrics.counter_family(lines, "polyglot_jobs_total", "Job outcomes counted by the leader broker since it started",
+                                   [({"broker": str(leader["id"]), "lang": c["lang"], "outcome": c["outcome"]}, c["value"])
+                                    for c in leader.get("counters", [])])
+            stats = [(m, m.get("stats") or {}) for m in members]
+            metrics.counter_family(lines, "polyglot_worker_translations_total", "Translations finished by each worker",
+                                   [({"worker": m["worker_id"], "lang": m["lang"]}, s.get("translated", 0)) for m, s in stats])
+            metrics.counter_family(lines, "polyglot_worker_failures_total", "Translations that failed on each worker",
+                                   [({"worker": m["worker_id"], "lang": m["lang"]}, s.get("failed", 0)) for m, s in stats])
+            metrics.counter_family(lines, "polyglot_translation_cache_hits_total", "Translations answered from a worker's cache",
+                                   [({"worker": m["worker_id"], "lang": m["lang"]}, s.get("cache_hits", 0)) for m, s in stats])
+        with self._rooms_lock:
+            rooms = len(self.rooms)
+        metrics.gauge(lines, "polyglot_rooms", "Rooms on this dashboard", [({}, rooms)])
+        metrics.gauge(lines, "polyglot_event_streams", "Browsers connected to the push stream", [({}, open_streams)])
+        quota = tts.SYNTHESIZER.quota_report()
+        metrics.gauge(lines, "polyglot_speech_calls_today", "Gemini speech calls made today, per model",
+                      [({"model": m["model"]}, m["used"]) for m in quota["models"]])
+        if quota["left"] is not None:
+            metrics.gauge(lines, "polyglot_speech_quota_left", "Relay-voice clips left today", [({}, quota["left"])])
+        return lines
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -716,6 +961,17 @@ class DashboardRuntime:
 class DashboardHandler(BaseHTTPRequestHandler):
     runtime: DashboardRuntime
     limiter = RequestRateLimiter()
+    open_streams = 0
+    _streams_lock = threading.Lock()
+
+    def _metrics(self) -> None:
+        payload = ("\n".join(self.runtime.metrics_lines(DashboardHandler.open_streams)) + "\n").encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -792,13 +1048,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             arguments = self._history_arguments(query_string)
             params = urllib.parse.parse_qs(query_string)
+            state = self._room_state()
             if not export:
-                return self._json(self.runtime.state.query_history(**arguments))
+                return self._json(state.query_history(**arguments))
             kind = (params.get("format") or ["txt"])[0]
             if kind not in caption_history.FORMATS:
                 raise ValueError("format must be txt, csv, json or srt")
-            arguments["limit"] = self.runtime.state._history_max
-            rows = self.runtime.state.query_history(**arguments)["chunks"]
+            arguments["limit"] = state._store.max_rows if state._store else state._history_max
+            rows = state.query_history(**arguments)["chunks"]
             langs = arguments["langs"] or list(config.TARGET_LANGUAGES)
             if not rows:
                 return self._json({"error": "No captions in that time range"}, HTTPStatus.NOT_FOUND)
@@ -832,6 +1089,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _supplied_view_credential(self) -> tuple[str, bool]:
         """(token the request carries, whether it arrived in the address - which earns a cookie)."""
         header = self.headers.get("X-View-Token") or self.headers.get("X-Access-Token")
+        bearer = self.headers.get("Authorization") or ""
+        if not header and bearer.lower().startswith("bearer "):
+            header = bearer[7:].strip()            # how Prometheus sends a token
         if header:
             return header, False
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -873,6 +1133,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if token:
             self.send_header("Set-Cookie", f"{self.VIEW_COOKIE}={urllib.parse.quote(token, safe='')}; Path=/; HttpOnly; SameSite=Lax")
 
+    def _room_name(self) -> str:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        return room_name((query.get("room") or [""])[0])
+
+    def _room_kwargs(self) -> dict[str, str]:
+        """{"room": name} for any room but the default one, so calls for the default room stay as they were."""
+        name = self._room_name()
+        return {} if name == DEFAULT_ROOM else {"room": name}
+
+    def _room_state(self) -> DashboardState:
+        return self.runtime.room(self._room_name())
+
+    def _events(self, state: DashboardState) -> None:
+        """Server-Sent Events: every caption, new chunk, activity line and worker change of one room, as it
+        happens. Browsers reconnect by themselves and send Last-Event-ID to carry on where they stopped."""
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        resume = self.headers.get("Last-Event-ID") or (query.get("after") or [""])[0]
+        try:
+            last = int(resume) if resume else state.feed_seq
+        except ValueError:
+            last = state.feed_seq
+        self.close_connection = True
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")          # tell a reverse proxy not to hold events back
+        self._remember_viewer(getattr(self, "_cookie_to_set", None))
+        self.end_headers()
+        deadline = time.monotonic() + EVENTS_MAX_SECONDS
+        with DashboardHandler._streams_lock:
+            DashboardHandler.open_streams += 1
+        try:
+            self.wfile.write(f"retry: 2000\nevent: hello\ndata: {json.dumps({'room': state.room, 'seq': last})}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            while not self.runtime.stop_event.is_set() and time.monotonic() < deadline:
+                events = state.events_after(last, timeout=EVENTS_KEEPALIVE_SECONDS)
+                if not events:
+                    self.wfile.write(b": keep-alive\n\n")
+                for seq, kind, data in events:
+                    payload = json.dumps(data, ensure_ascii=False)
+                    self.wfile.write(f"id: {seq}\nevent: {kind}\ndata: {payload}\n\n".encode("utf-8"))
+                    last = seq
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return                                            # the browser went away
+        finally:
+            with DashboardHandler._streams_lock:
+                DashboardHandler.open_streams -= 1
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/health":
@@ -881,14 +1190,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not allowed:
             return self._refuse_viewer()
         self._cookie_to_set = remember
+        if parsed.path.startswith("/api/") and parsed.path not in ("/api/languages",):
+            try:
+                self._room_name()
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        if parsed.path == "/metrics":
+            return self._metrics()
+        if parsed.path == "/api/tts/info":
+            return self._json({"voices": list(tts.VOICES), "quota": tts.SYNTHESIZER.quota_report(),
+                               "warn_when_left": tts.WARN_WHEN_LEFT})
+        if parsed.path == "/api/rooms":
+            return self._json({"rooms": self.runtime.room_list(), "max_rooms": max_rooms()})
+        if parsed.path == "/api/events":
+            try:
+                return self._events(self._room_state())
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         if parsed.path == "/api/history":
             return self._history(parsed.query, export=False)
         if parsed.path == "/api/export":
             return self._history(parsed.query, export=True)
         if parsed.path == "/api/status":
-            return self._json(self.runtime.status())
+            try:
+                return self._json(self.runtime.status(**self._room_kwargs()))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         if parsed.path == "/api/captions":
-            return self._json(self.runtime.state.snapshot()["captions"])
+            try:
+                return self._json(self._room_state().snapshot()["captions"])
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         if parsed.path == "/api/languages":
             languages = [{"code": code, **meta} for code, meta in config.LANGUAGES.items()]
             return self._json({"languages": languages})
@@ -954,27 +1286,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             if speak:
                 return self._speak()
-            if self.path == "/api/captions":
+            path = urllib.parse.urlsplit(self.path).path
+            room = self._room_kwargs()
+            if path == "/api/captions":
                 body = self._body()
-                self.runtime.submit(str(body.get("text", "")), body.get("source_lang") or None)
+                self.runtime.submit(str(body.get("text", "")), body.get("source_lang") or None, **room)
                 return self._json({"accepted": True}, HTTPStatus.ACCEPTED)
             if self.path.startswith("/api/captions/audio"):
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 source_lang = (query.get("source_lang", [None])[0]) or None
                 data = self._raw_body(MAX_AUDIO_UPLOAD_BYTES)
-                self.runtime.start_audio(data, source_lang)
+                self.runtime.start_audio(data, source_lang, **room)
                 return self._json({"accepted": True, "status": "transcribing"}, HTTPStatus.ACCEPTED)
+            if path == "/api/live/interim":
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                source_lang = (query.get("source_lang", [None])[0]) or None
+                data = self._raw_body(MAX_LIVE_SLICE_BYTES)
+                self.runtime.interim(data, source_lang, **room)
+                return self._json({"accepted": True}, HTTPStatus.ACCEPTED)
             if self.path.startswith("/api/live/slice"):
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 source_lang = (query.get("source_lang", [None])[0]) or None
                 data = self._raw_body(MAX_LIVE_SLICE_BYTES)
-                queued = self.runtime.enqueue_live_slice(data, source_lang)
+                queued = self.runtime.enqueue_live_slice(data, source_lang, **room)
                 return self._json({"accepted": True, "queued": queued}, HTTPStatus.ACCEPTED)
-            if self.path == "/api/demo":
-                self.runtime.run_demo()
+            if path == "/api/demo":
+                self.runtime.run_demo(**room)
                 return self._json({"accepted": True, "count": len(DEMO_SENTENCES)}, HTTPStatus.ACCEPTED)
-            if self.path == "/api/clear":
-                self.runtime.state.clear()
+            if path == "/api/clear":
+                self._room_state().clear()
                 return self._json({"cleared": True})
             self.send_error(HTTPStatus.NOT_FOUND)
         except LiveBacklogError as exc:
@@ -985,12 +1325,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _speak(self) -> None:
         body = self._body()
         try:
-            wav = tts.SYNTHESIZER.synthesize(str(body.get("text", "")), str(body.get("lang", "")))
+            voice = body.get("voice") or None
+            wav = tts.SYNTHESIZER.synthesize(str(body.get("text", "")), str(body.get("lang", "")),
+                                             **({"voice": str(voice)} if voice else {}))
         except tts.TtsError as exc:
             return self._json({"error": str(exc)}, HTTPStatus(exc.status))
+        left = tts.SYNTHESIZER.quota_report()["left"]
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(wav)))
+        if left is not None:
+            self.send_header("X-Speech-Quota-Left", str(left))
         self.send_header("Cache-Control", "private, max-age=3600")
         self.end_headers()
         self.wfile.write(wav)
