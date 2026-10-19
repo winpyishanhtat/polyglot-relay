@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any
 
 from common import config
@@ -26,6 +26,8 @@ from common.discovery import connect_to_leader
 from common.protocol import ProtocolError, authenticate, cluster_secret, decode_stream, encode, recv_one
 
 LOG = logging.getLogger("polyglot.worker")
+# A listener that connects is sent the captions finished in this many seconds before it arrived.
+LISTENER_REPLAY_SECONDS = max(0.0, float(os.getenv("POLYGLOT_LISTENER_REPLAY_SECONDS") or "30"))
 
 _RETRYABLE_STATUS = {429, 500, 503}
 
@@ -547,6 +549,8 @@ class TranslatorWorker:
         self._finished: OrderedDict[str, dict] = OrderedDict()
         self.translated_count = 0
         self.failed_count = 0
+        # Captions broadcast lately (by any worker of this language), sent to a listener that connects.
+        self._recent_captions: deque[dict] = deque(maxlen=300)
 
     def serve(self) -> None:
         self._start_listener_server()
@@ -691,9 +695,7 @@ class TranslatorWorker:
                 # With a cluster secret, a caption listener must first prove it knows it (its "subscribe").
                 threading.Thread(target=self._admit_listener, args=(conn, address), daemon=True).start()
                 continue
-            with self._listeners_lock:
-                self.listeners.add(conn)
-            LOG.info("Listener connected from %s:%s", *address)
+            self._welcome_listener(conn, address)
 
     def _admit_listener(self, conn: socket.socket, address) -> None:
         try:
@@ -709,13 +711,37 @@ class TranslatorWorker:
             except OSError:
                 pass
             return
+        self._welcome_listener(conn, address)
+
+    def _welcome_listener(self, conn: socket.socket, address) -> None:
+        """Add a listener and send it what this worker translated in the last LISTENER_REPLAY_SECONDS.
+        A listener that was reconnecting (this worker just restarted, or the dashboard did) would otherwise
+        miss a caption finished in that gap - typically a job the broker replayed the moment the worker came
+        back. Listeners ignore captions they already have. Sent under the listeners lock, so a replayed
+        caption is never interleaved with a broadcast on the same socket."""
+        cutoff = time.time() - LISTENER_REPLAY_SECONDS
         with self._listeners_lock:
+            # Taken under the same lock as a broadcast, so every caption is either in this replay or reaches
+            # this listener through the broadcast, never neither.
+            recent = [r for r in self._recent_captions
+                      if LISTENER_REPLAY_SECONDS > 0 and float(r.get("timestamp", 0)) >= cutoff]
+            try:
+                for result in recent:
+                    conn.sendall(encode(result))
+            except OSError:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return
             self.listeners.add(conn)
-        LOG.info("Listener connected from %s:%s", *address)
+        LOG.info("Listener connected from %s:%s%s", *address,
+                 f" (sent the {len(recent)} caption(s) of the last {LISTENER_REPLAY_SECONDS:.0f}s)" if recent else "")
 
     def _broadcast(self, message: dict) -> None:
         payload = encode(message)
         with self._listeners_lock:
+            self._recent_captions.append(message)
             listeners = list(self.listeners)
         for listener in listeners:
             try:

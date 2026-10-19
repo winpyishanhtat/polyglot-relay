@@ -361,6 +361,13 @@ results/mt_context.json` gives chrF++ per language for both runs and a paired-bo
 difference. (FLEURS sentences are ordered by sentence id, which keeps an article's sentences together.)
 COMET is not included: it needs a 2 GB neural model and PyTorch; chrF++ is computed exactly as sacrebleu does.
 
+Measured on 2026-10-19 (`results/context_ab.json`): 60 FLEURS sentences per language, each translated to
+English by Gemini without and with the two previous sentences. The differences were between -0.9 and +0.9
+chrF++ and **none was significant** (every 95% interval contains 0; e.g. Burmese 56.35 vs 55.77, Vietnamese
+62.86 vs 63.76). FLEURS sentences are mostly independent of each other, so this shows that context does no
+harm; the consistency it is meant for (names, pronouns, gender carried across sentences of one talk) needs a
+test set of continuous speech to measure.
+
 `failover_trials` kills the leader N times and reports the distribution of time-to-new-leader
 (4.75 s, SD 0.02 s over 10 trials with the default 1 s heartbeat / 3 s timeout; the earlier 2 s / 6 s
 defaults took 8.12 s). `--brokers 3 --kills 2` kills the leader twice in a row (4.7 s, then 4.0 s).

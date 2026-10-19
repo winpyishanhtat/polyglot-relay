@@ -194,6 +194,10 @@ services:
     command: ["python", "web_ui.py", "--host", "0.0.0.0", "--port", "8080"]
     environment:
       <<: *common-environment
+      # Keep the history across restarts (SQLite, e.g. /data/history.db), and the access and viewing tokens.
+      POLYGLOT_HISTORY_FILE: ${POLYGLOT_HISTORY_FILE:-}
+      POLYGLOT_ACCESS_TOKEN: ${POLYGLOT_ACCESS_TOKEN:-}
+      POLYGLOT_VIEW_TOKEN: ${POLYGLOT_VIEW_TOKEN:-}
       # Rooms, push updates and translation context (see README).
       POLYGLOT_MAX_ROOMS: ${POLYGLOT_MAX_ROOMS:-}
       POLYGLOT_CONTEXT_SENTENCES: ${POLYGLOT_CONTEXT_SENTENCES:-}
