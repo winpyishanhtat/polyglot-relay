@@ -8,6 +8,8 @@ import unittest
 import urllib.request
 from pathlib import Path
 
+import hermetic  # noqa: F401  (no real API keys or deployment settings leak into the run)
+
 ROOT = Path(__file__).resolve().parents[1]
 PORT1, PORT2 = 17501, 17502
 BUFFERS = {}

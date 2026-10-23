@@ -481,7 +481,7 @@ class FailoverToolTests(unittest.TestCase):
                 "POLYGLOT_ELECTION_TIMEOUT": "0.2", "POLYGLOT_CONNECT_TIMEOUT": "0.2"}
         times = failover_trials.run_chain(fast, brokers=3, kills=2, settle_timeout=20, recovery_timeout=20)
         self.assertEqual(len(times), 2)                  # broker 2 took over, then broker 1
-        self.assertTrue(all(0.05 < t < 8.0 for t in times), times)
+        self.assertTrue(all(0.0 < t < 8.0 for t in times), times)   # measured after each kill; a standby that already noticed can take over in tens of ms
 
 
 if __name__ == "__main__":

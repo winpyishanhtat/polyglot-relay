@@ -7,6 +7,8 @@ from unittest import mock
 from common import config
 from broker import Broker, WorkerConnection
 
+import hermetic  # noqa: F401  (no real API keys or deployment settings leak into the run)
+
 class FakeSocket:
     def __init__(self): self.frames = []; self.closed = False
     def sendall(self, payload): self.frames.append(json.loads(payload.decode()))

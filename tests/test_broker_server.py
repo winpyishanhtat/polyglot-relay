@@ -13,6 +13,8 @@ from broker import Broker, WorkerConnection, WorkerRegistry
 from common import config
 from common.protocol import encode, recv_one
 
+import hermetic  # noqa: F401  (no real API keys or deployment settings leak into the run)
+
 
 class FakeSocket:
     def __init__(self, fail=False):

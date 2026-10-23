@@ -17,17 +17,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
       - name: Light optional dependencies (numpy for the audio paths)
         run: python -m pip install "numpy<2"
       - name: Python suite (also runs the JavaScript tests through Node)
-        run: python -m unittest discover -s tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests 2>&1 | tee unit.log || { python tools/ci_annotate.py unit.log; exit 1; }
       - name: JavaScript tests on their own, for readable output
         run: node --test tests/js/app.test.js tests/js/speech.test.js tests/js/listen.test.js tests/js/listen_page.test.js
 
@@ -36,17 +39,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - name: Build and run the test image
-        run: docker compose --profile test run --rm --build tests
+        shell: bash
+        run: |
+          set -o pipefail
+          docker compose --profile test run --rm --build tests 2>&1 | tee docker-tests.log || { python tools/ci_annotate.py docker-tests.log; exit 1; }
 
   smoke:
     name: Smoke test of a running relay
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Start three brokers, nine mock worker pools and the dashboard
@@ -68,8 +77,8 @@ jobs:
     timeout-minutes: 30
     needs: smoke
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Start the relay
