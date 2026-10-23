@@ -19,7 +19,8 @@
   "real_speech_dropped_if_loud": 0,
   "real_speech_dropped_if_quiet": 0,
   "dropped_examples": [],
-  "known_fragments": 22,
-  "known_fragments_caught": 22,
+  "max_foreign_script_share": 0.18181818181818182,
+  "known_fragments": 23,
+  "known_fragments_caught": 23,
   "missed_fragments": []
 }

@@ -146,8 +146,9 @@ class ProtectionTests(unittest.TestCase):
     def test_a_placeholder_bent_by_the_translator_is_still_recognised(self):
         g = make(UIT="*")
         _, restore = g.protect("at UIT", "th")
-        self.assertEqual(restore("at zqx0q"), "at UIT")
-        self.assertEqual(restore("at ZQX 0Q"), "at UIT")
+        self.assertEqual(restore("at <X0/>"), "at UIT")
+        self.assertEqual(restore("at <x0 />"), "at UIT")
+        self.assertEqual(restore("at < x0 / >"), "at UIT")
 
     def test_a_lost_placeholder_is_reported_so_the_caller_can_retry(self):
         g = make(UIT="*", Lab="*")
@@ -232,6 +233,37 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("“UIT” → “UIT”", instruction)
         self.assertEqual(fake.requests[0]["contents"], "See you at UIT")        # only the new fragment is translated
 
+    def test_a_name_gemini_transliterated_is_fixed_with_placeholders(self):
+        replies = iter(["วิน presents", "<x0/> presents"])        # first ignores the glossary
+        fake = FakeGemini()
+        fake.client.models.generate_content = lambda model, contents, config: (
+            fake.requests.append({"contents": contents, "instruction": config.system_instruction}) or types.SimpleNamespace(text=next(replies)))
+        translator = gemini_translator(terms={"Win Pyi Shan Htat": "*"})
+        translator._get_client = lambda: fake.client
+        with mock.patch.dict(sys.modules, fake.modules):
+            translated, _ = translator.translate("Win Pyi Shan Htat presents", source_lang="en")
+        self.assertEqual(translated, "Win Pyi Shan Htat presents")
+        self.assertEqual(len(fake.requests), 2)
+        self.assertIn("<x0/>", fake.requests[1]["contents"])
+        self.assertIn("copy every such tag", fake.requests[1]["instruction"])
+
+    def test_a_translation_that_kept_the_terms_costs_one_call(self):
+        fake = FakeGemini(reply="Win Pyi Shan Htat presents")
+        translator = gemini_translator(terms={"Win Pyi Shan Htat": "*"})
+        translator._get_client = lambda: fake.client
+        with mock.patch.dict(sys.modules, fake.modules):
+            translator.translate("Win Pyi Shan Htat presents", source_lang="en")
+        self.assertEqual(len(fake.requests), 1)
+
+    def test_if_the_retry_also_loses_the_term_the_first_answer_is_kept(self):
+        replies = iter(["first answer", "mangled"])
+        fake = FakeGemini()
+        fake.client.models.generate_content = lambda model, contents, config: types.SimpleNamespace(text=next(replies))
+        translator = gemini_translator(terms={"UIT": "*"})
+        translator._get_client = lambda: fake.client
+        with mock.patch.dict(sys.modules, fake.modules):
+            self.assertEqual(translator.translate("At UIT", source_lang="en")[0], "first answer")
+
     def test_without_context_or_terms_the_instruction_is_as_before(self):
         from translator_worker import translation_instruction
         fake = FakeGemini()
@@ -242,13 +274,13 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(fake.requests[0]["instruction"], translation_instruction("th", "en"))
 
     def test_the_cache_ignores_context_but_not_a_changed_glossary(self):
-        fake = FakeGemini()
+        fake = FakeGemini(reply="O UIT")                      # keeps the term, so one call per translation
         translator = gemini_translator(terms={"UIT": "*"})
         translator._get_client = lambda: fake.client
         with mock.patch.dict(sys.modules, fake.modules):
             translator.translate("At UIT", source_lang="en", context=["a"])
             self.assertEqual(translator.translate("At UIT", source_lang="en", context=["b"])[1], "cache")
-            translator.glossary._install({"UIT": {"th": "UIT-TH"}})            # the organisers changed a term
+            translator.glossary._install({"UIT": {"th": "O UIT"}})             # the organisers changed a term
             self.assertEqual(translator.translate("At UIT", source_lang="en")[1], "gemini-text")
         self.assertEqual(len(fake.requests), 2)
 
@@ -273,7 +305,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(translated, "Cai BROKER-VI o UIT")
 
     def test_if_libretranslate_mangles_a_placeholder_it_translates_plainly_instead(self):
-        translator, sent = self.libre(lambda text: "mangled" if "ZQX" in text else "plain translation")
+        translator, sent = self.libre(lambda text: "mangled" if "<x" in text else "plain translation")
         translated, _ = translator.translate("The broker at UIT", source_lang="en")
         self.assertEqual(translated, "plain translation")
         self.assertEqual(len(sent), 2)

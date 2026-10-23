@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import fragment_guard
+import voice_check
 from common import config
 from common.discovery import connect_to_leader
 from common.protocol import ProtocolError, decode_stream, encode
@@ -279,6 +280,8 @@ def _window_is_unusable(window: Any, sample_rate: int) -> bool:
 # Longest we will wait between Gemini transcription retries. A live slice is
 # only a few seconds long, so a long back-off is worse than a gap.
 _GEMINI_STT_MAX_BACKOFF = 6.0
+# The shortest leftover at the end of a file that is transcribed on its own (see transcribe_file).
+MIN_TAIL_SECONDS = 5.0
 
 
 def _transcribe_window_via_gemini(window: Any, sample_rate: int, language: str) -> str | None:
@@ -446,8 +449,20 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
     # unprompted.
     window_seconds = max(5, min(60, float(os.getenv("POLYGLOT_FILE_CHUNK_SECONDS", "15"))))
     window_samples = int(window_seconds * sample_rate)
-    for offset in range(0, len(audio), window_samples):
-        window = audio[offset:offset + window_samples]
+    # A short leftover at the end (under MIN_TAIL_SECONDS) joins the window before it: alone, a second of the
+    # end of a sentence, or of breath, comes back as an invented word ("France", "Great panic" on a Khmer clip).
+    tail_samples = int(MIN_TAIL_SECONDS * sample_rate)
+    offsets = list(range(0, len(audio), window_samples))
+    if len(offsets) > 1 and len(audio) - offsets[-1] < tail_samples:
+        offsets.pop()
+    for index, offset in enumerate(offsets):
+        end = offsets[index + 1] if index + 1 < len(offsets) else len(audio)
+        window = audio[offset:end]
+        # A window that is steady and has no voice in it (hum, hiss, a fan) is not sent at all: transcribers
+        # invent words for such sounds (see voice_check.py).
+        if voice_check.not_a_voice(window, sample_rate):
+            LOG.info("Skipped a window with no voice in it (%s)", voice_check.reason(window, sample_rate))
+            continue
 
         # Whisper is unreliable for these three regardless of model size
         # (confirmed by direct testing - see _GEMINI_STT_LANGUAGES above);
@@ -460,7 +475,8 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
                 continue  # silence, not a failure: nothing to transcribe, nothing missed
             gemini_text = _transcribe_window_via_gemini(window, sample_rate, language)
             if gemini_text is not None:
-                if gemini_text and not _spurious(gemini_text, window):
+                gemini_text = _tidy_transcript(gemini_text) if gemini_text else gemini_text
+                if gemini_text and not _spurious(gemini_text, window, language):
                     yield gemini_text, _pcm16(window), language
                 continue
             if language in _GEMINI_STT_LANGUAGES:
@@ -516,8 +532,18 @@ def transcribe_file(path: pathlib.Path, model_name: str, language: str | None = 
                 if recovered:
                     text, detected = recovered
 
-        if text and not _spurious(text, window):
+        text = _tidy_transcript(text) if text else text
+        if text and not _spurious(text, window, detected or language):
             yield text, _pcm16(window), detected
+
+
+_SEGMENTATION_UNDERSCORE = re.compile(r"(?<=\w)_(?=\w)")
+
+
+def _tidy_transcript(text: str) -> str:
+    """Underscores between letters are a word-segmentation artifact (Gemini once returned Vietnamese as
+    "văn_hóa ... bộ_lạc"); nobody says them, so they become spaces."""
+    return _SEGMENTATION_UNDERSCORE.sub(" ", text)
 
 
 def _loudness(window: Any) -> float | None:
@@ -527,11 +553,11 @@ def _loudness(window: Any) -> float | None:
         return None
 
 
-def _spurious(text: str, window: Any) -> bool:
+def _spurious(text: str, window: Any, lang: str | None = None) -> bool:
     """A transcript invented for silence or music (see fragment_guard.py) is dropped, not translated."""
     rms = _loudness(window)
-    if fragment_guard.is_spurious(text, rms):
-        LOG.info("Dropped a fragment that is not speech (%s): %r", fragment_guard.reason(text, rms), text[:80])
+    if fragment_guard.is_spurious(text, rms, lang):
+        LOG.info("Dropped a fragment that is not speech (%s): %r", fragment_guard.reason(text, rms, lang), text[:80])
         return True
     return False
 

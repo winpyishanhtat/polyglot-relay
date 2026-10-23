@@ -466,6 +466,20 @@ class Translator:
         time.sleep(self.stagger_seconds)
         instruction = (translation_instruction(self.lang, source_lang) + glossary.context_instruction(context)
                        + self.glossary.instruction(text, self.lang))
+        translated = self._gemini_once(types, text, instruction)
+        # Gemini sometimes transliterates a name the glossary says to keep (seen live: Thai). Then ask once
+        # more with those terms swapped for placeholders, as LibreTranslate gets them, and put them back.
+        required = self.glossary.matches(text, self.lang)
+        if required and any(rendering not in translated for _term, rendering in required):
+            protected, restore = self.glossary.protect(text, self.lang)
+            note = (" Some words are tags like <x0/>: copy every such tag exactly as it is, in the right place.")
+            retried = restore(self._gemini_once(types, protected, instruction + note))
+            if retried and all(rendering in retried for _term, rendering in required):
+                LOG.info("Glossary terms restored with placeholders for a %s translation", self.lang)
+                return retried
+        return translated
+
+    def _gemini_once(self, types, text: str, instruction: str) -> str:
         def request():
             self._await_gemini_slot()
             self.report_status("translating", "Gemini request in progress")

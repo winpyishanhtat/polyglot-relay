@@ -1,0 +1,176 @@
+{
+  "thresholds": {
+    "max_steady_db": 6.0,
+    "min_voice_share": 0.15,
+    "max_flatness": 0.5
+  },
+  "speech_windows_3s": 5266,
+  "speech_windows_rejected": 24,
+  "speech_windows_rejected_examples": [
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 12,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 15,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 18,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 21,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 24,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 27,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 30,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 33,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-12419882125114087229",
+      "lang": "id",
+      "start_s": 36,
+      "rejected": "almost no energy in the voice band (2%): hum or rumble"
+    },
+    {
+      "id": "id-13129278352658383129",
+      "lang": "id",
+      "start_s": 15,
+      "rejected": "almost no energy in the voice band (1%): hum or rumble"
+    }
+  ],
+  "speech_recordings": 1350,
+  "speech_rejected": 0,
+  "speech_voice_share": {
+    "min": 0.0739,
+    "median": 0.4765
+  },
+  "speech_flatness": {
+    "max": 0.6971,
+    "median": 0.0699
+  },
+  "speech_rejected_examples": [],
+  "noise": [
+    {
+      "name": "white 0.002",
+      "voice": 0.3856,
+      "flatness": 0.9944,
+      "variation_db": 0.7,
+      "rejected": "a flat, noise-like spectrum (flatness 0.99): hiss or fan"
+    },
+    {
+      "name": "pink 0.002",
+      "voice": 0.4859,
+      "flatness": 0.655,
+      "variation_db": 3.6,
+      "rejected": "a flat, noise-like spectrum (flatness 0.65): hiss or fan"
+    },
+    {
+      "name": "brown 0.002",
+      "voice": 0.147,
+      "flatness": 0.164,
+      "variation_db": 17.3,
+      "rejected": null
+    },
+    {
+      "name": "white 0.02",
+      "voice": 0.3856,
+      "flatness": 0.9944,
+      "variation_db": 0.7,
+      "rejected": "a flat, noise-like spectrum (flatness 0.99): hiss or fan"
+    },
+    {
+      "name": "pink 0.02",
+      "voice": 0.4859,
+      "flatness": 0.655,
+      "variation_db": 3.6,
+      "rejected": "a flat, noise-like spectrum (flatness 0.65): hiss or fan"
+    },
+    {
+      "name": "brown 0.02",
+      "voice": 0.147,
+      "flatness": 0.164,
+      "variation_db": 17.3,
+      "rejected": null
+    },
+    {
+      "name": "white 0.2",
+      "voice": 0.3856,
+      "flatness": 0.9944,
+      "variation_db": 0.7,
+      "rejected": "a flat, noise-like spectrum (flatness 0.99): hiss or fan"
+    },
+    {
+      "name": "pink 0.2",
+      "voice": 0.4859,
+      "flatness": 0.655,
+      "variation_db": 3.6,
+      "rejected": "a flat, noise-like spectrum (flatness 0.65): hiss or fan"
+    },
+    {
+      "name": "brown 0.2",
+      "voice": 0.147,
+      "flatness": 0.164,
+      "variation_db": 17.3,
+      "rejected": null
+    },
+    {
+      "name": "hum 50 Hz",
+      "voice": 0.0,
+      "flatness": 0.0,
+      "variation_db": 1.8,
+      "rejected": "almost no energy in the voice band (0%): hum or rumble"
+    },
+    {
+      "name": "hum 50 Hz + hiss",
+      "voice": 0.0002,
+      "flatness": 0.0012,
+      "variation_db": 1.8,
+      "rejected": "almost no energy in the voice band (0%): hum or rumble"
+    },
+    {
+      "name": "hum 60 Hz",
+      "voice": 0.0,
+      "flatness": 0.0,
+      "variation_db": 0.4,
+      "rejected": "almost no energy in the voice band (0%): hum or rumble"
+    },
+    {
+      "name": "hum 60 Hz + hiss",
+      "voice": 0.0001,
+      "flatness": 0.0008,
+      "variation_db": 0.4,
+      "rejected": "almost no energy in the voice band (0%): hum or rumble"
+    }
+  ],
+  "noise_rejected": 10
+}

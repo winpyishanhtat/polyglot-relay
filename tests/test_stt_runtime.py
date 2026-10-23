@@ -206,6 +206,10 @@ class TranscribeFileTests(unittest.TestCase):
     def setUp(self):
         stt_service._WHISPER_CACHE.clear()
         self.addCleanup(stt_service._WHISPER_CACHE.clear)
+        # These tests use synthetic signals that are not speech; the voice check has its own tests.
+        voice = mock.patch.object(stt_service.voice_check, "not_a_voice", return_value=False)
+        voice.start()
+        self.addCleanup(voice.stop)
 
     def run_file(self, fake, language=None, on_unrecognized=None, **env):
         stt_service._WHISPER_CACHE.clear()  # each fake whisper must be the one that gets loaded
@@ -217,6 +221,20 @@ class TranscribeFileTests(unittest.TestCase):
         out = self.run_file(fake)
         self.assertEqual([text for text, _, _ in out], ["part 0", "part 1", "part 2"])
         self.assertEqual([n for n, _ in fake.transcribe_calls], [15 * 16000, 15 * 16000, 10 * 16000])
+
+    def test_a_short_tail_joins_the_window_before_it(self):
+        fake = FakeWhisper([{"language": "en", "segments": [seg(f"part {n}")]} for n in range(3)], seconds=33)
+        out = self.run_file(fake)
+        self.assertEqual([text for text, _, _ in out], ["part 0", "part 1"])
+        self.assertEqual([n for n, _ in fake.transcribe_calls], [15 * 16000, 18 * 16000])     # 3 s tail joined
+
+    def test_a_clip_shorter_than_a_tail_is_still_transcribed(self):
+        fake = FakeWhisper([{"language": "en", "segments": [seg("short")]}], seconds=3)
+        self.assertEqual([text for text, _, _ in self.run_file(fake)], ["short"])
+
+    def test_word_segmentation_underscores_become_spaces(self):
+        fake = FakeWhisper([{"language": "vi", "segments": [seg("văn_hóa và bộ_lạc, file_name")]}], seconds=3)
+        self.assertEqual(self.run_file(fake)[0][0], "văn hóa và bộ lạc, file name")
 
     def test_window_length_is_configurable_but_clamped(self):
         for configured, expected in (("1", 5), ("20", 20), ("999", 60)):
@@ -446,6 +464,10 @@ class WindowGuardTests(unittest.TestCase):
     def setUp(self):
         stt_service._WHISPER_CACHE.clear()
         self.addCleanup(stt_service._WHISPER_CACHE.clear)
+        # These tests use synthetic signals that are not speech; the voice check has its own tests.
+        voice = mock.patch.object(stt_service.voice_check, "not_a_voice", return_value=False)
+        voice.start()
+        self.addCleanup(voice.stop)
 
     def run_clip(self, samples, language="my", **env):
         class Clip(FakeWhisper):
@@ -459,6 +481,15 @@ class WindowGuardTests(unittest.TestCase):
 
     def tone(self, seconds, level=0.05):
         return np.full(int(seconds * 16000), level, dtype=np.float32)
+
+    def test_a_hum_with_no_voice_in_it_is_not_sent_at_all(self):
+        mock.patch.stopall()          # use the real voice check here
+        t = np.arange(16000 * 3) / 16000
+        hum = (0.3 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)
+        with self.assertLogs("polyglot.stt", level="INFO") as logs:
+            out, calls, gaps = self.run_clip(hum, language="en")
+        self.assertEqual((out, calls, gaps), ([], [], []))
+        self.assertTrue(any("no voice in it" in line for line in logs.output))
 
     def test_pure_silence_is_skipped_and_is_not_a_failure(self):
         out, calls, gaps = self.run_clip(np.zeros(16000 * 3, dtype=np.float32))

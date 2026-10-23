@@ -8,3 +8,4 @@ eval/scenario_events.jsonl
 .coverage
 htmlcov/
 monitoring/view-token
+glossary.json

@@ -76,7 +76,8 @@ Open **[http://localhost:8000](http://localhost:8000)**. Add a `GEMINI_API_KEY` 
 docker compose up --build
 ```
 
-Full Docker walkthrough — including a pure-Gemini overlay, worker-failure and broker-failover demos — in [DOCKER.md](DOCKER.md).
+Full Docker walkthrough — including a pure-Gemini overlay, worker-failure and broker-failover demos — in [DOCKER.md](DOCKER.md). A 12-minute presentation script (live speech, rooms, killing the leader while
+Grafana shows it) is in [docs/DEMO.md](docs/DEMO.md).
 
 ## Tech stack
 
@@ -269,7 +270,10 @@ cluster behind a VPN/TLS tunnel) if the captions themselves are sensitive.
   way (see `glossary.example.json`): `"UIT": "*"` keeps a name as written in every language,
   `"broker": {"th": "..."}` fixes one language's rendering. Gemini is given the renderings of the terms in each
   sentence; for LibreTranslate the terms are swapped for placeholders it leaves alone and put back afterwards
-  (and if it mangles a placeholder the sentence is translated plainly instead). The file is re-read when it
+  (and if it mangles a placeholder the sentence is translated plainly instead). The placeholders are short
+  tags (`<x0/>`): of eight styles tried on LibreTranslate, only these survived in Vietnamese, Indonesian, Thai,
+  Malay and Filipino. If Gemini ignores the glossary (seen once, transliterating a name into Thai), the sentence
+  is asked again with the same placeholders, so the name comes back as written. The file is re-read when it
   changes, so terms can be added during an event. In Docker, copy it into the project before building, or
   mount it (`- ./glossary.json:/glossary.json:ro` on the workers) and set `POLYGLOT_GLOSSARY_FILE=/glossary.json`.
 
@@ -288,6 +292,21 @@ cluster behind a VPN/TLS tunnel) if the captions themselves are sensitive.
   references and every Gemini and Whisper transcript, nine languages) it drops **none**, even treating every
   one as quiet audio, and it catches all 22 fragments in the test list (the list it was written against, so
   that figure shows coverage, not an independent measurement). `POLYGLOT_FRAGMENT_GUARD=0` turns it off.
+- **Sounds that are not a voice:** before anything is transcribed, `voice_check.py` looks at the audio itself.
+  A window that is steady (its loudness varies by under 6 dB, while speech rises and falls with every syllable)
+  and either has almost no energy in the voice band (hum, rumble) or a noise-flat spectrum (hiss, fan) is not
+  sent at all. Live, Gemini had turned faint hiss into "Is that better?" and a 60 Hz hum into "subsonic"; now
+  neither produces a caption. Measured first (`python -m eval.voice_check_eval`, `results/voice_check.json`):
+  none of the 1,350 FLEURS recordings is rejected, and of 5,266 three-second pieces of them, the 24 rejected all
+  lie in long stretches of background rumble after the speaker finished (in four unusually long recordings).
+  White and pink noise and 50/60 Hz hum are rejected. `POLYGLOT_VOICE_CHECK=0` turns it off.
+- **Wrong script:** a transcript for Burmese, Khmer, Lao or Thai that is a quarter or more in another
+  non-Latin script is dropped (a Khmer tail came back partly in Thai letters). Latin always passes, and Lao and
+  Thai accept each other's script, because Lao speech is often written in Thai letters with the right meaning.
+  On FLEURS the highest share of foreign script in real speech is 18%.
+- **Short tails and segmentation marks:** when a file is cut into 15-second windows, a leftover under 5 seconds
+  joins the window before it, since a lone second of audio came back as an invented word; underscores between
+  letters (Gemini once returned Vietnamese word-segmented, "văn_hóa") become spaces.
 
 ## Monitoring
 

@@ -30,6 +30,8 @@ x-common-environment: &common-environment
   POLYGLOT_GLOSSARY_FILE: ${POLYGLOT_GLOSSARY_FILE:-}
   # Drop transcripts invented for silence or music ("Thanks for watching!"); 0 turns it off.
   POLYGLOT_FRAGMENT_GUARD: ${POLYGLOT_FRAGMENT_GUARD:-}
+  # Skip audio with no voice in it (hum, hiss, a fan) before transcribing; 0 turns it off.
+  POLYGLOT_VOICE_CHECK: ${POLYGLOT_VOICE_CHECK:-}
 
 x-app: &app
   image: polyglot-relay:mock

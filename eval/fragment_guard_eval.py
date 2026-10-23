@@ -22,6 +22,9 @@ sys.path.insert(0, str(ROOT))
 
 import fragment_guard  # noqa: E402
 
+# (text, spoken language) pairs a transcriber produced for silence, noise or a tail of audio.
+KNOWN_MIXED_SCRIPT = [("មហាភ័យរราย", "km")]   # live, 2026-10-23: Khmer with Thai letters
+
 KNOWN_FRAGMENTS = [
     "Thank you.", "Thanks for watching!", "Thank you for watching.", " you", "Bye.", "...", "♪", "♪♪♪", "[Music]",
     "(upbeat music)", "Subtitles by the Amara.org community", "Please subscribe to my channel.",
@@ -49,20 +52,23 @@ def load_sentences(data: pathlib.Path) -> list[dict]:
 
 def evaluate(data: pathlib.Path) -> dict:
     sentences = load_sentences(data)
-    dropped_loud = [s for s in sentences if fragment_guard.reason(s["text"], rms=1.0)]
-    dropped_quiet = [s for s in sentences if fragment_guard.reason(s["text"], rms=0.0)]
+    # Each sentence is checked with its spoken language, as the relay does, so the script rule is exercised too.
+    dropped_loud = [s for s in sentences if fragment_guard.reason(s["text"], rms=1.0, lang=s["lang"])]
+    dropped_quiet = [s for s in sentences if fragment_guard.reason(s["text"], rms=0.0, lang=s["lang"])]
     by_lang: dict[str, int] = {}
     for s in sentences:
         by_lang[s["lang"]] = by_lang.get(s["lang"], 0) + 1
     caught = {text: fragment_guard.reason(text, rms=0.0) for text in KNOWN_FRAGMENTS}
+    caught.update({text: fragment_guard.reason(text, rms=None, lang=lang) for text, lang in KNOWN_MIXED_SCRIPT})
     return {
         "sentences_checked": len(sentences),
         "by_language": by_lang,
         "by_source": {source: sum(1 for s in sentences if s["source"] == source) for source in sorted({s["source"] for s in sentences})},
         "real_speech_dropped_if_loud": len(dropped_loud),
         "real_speech_dropped_if_quiet": len(dropped_quiet),
-        "dropped_examples": [{**s, "reason": fragment_guard.reason(s["text"], rms=0.0)} for s in dropped_quiet[:20]],
-        "known_fragments": len(KNOWN_FRAGMENTS),
+        "dropped_examples": [{**s, "reason": fragment_guard.reason(s["text"], rms=0.0, lang=s["lang"])} for s in dropped_quiet[:20]],
+        "max_foreign_script_share": max(fragment_guard.foreign_script_share(s["text"], s["lang"]) for s in sentences),
+        "known_fragments": len(KNOWN_FRAGMENTS) + len(KNOWN_MIXED_SCRIPT),
         "known_fragments_caught": sum(1 for r in caught.values() if r),
         "missed_fragments": [text for text, r in caught.items() if not r],
     }

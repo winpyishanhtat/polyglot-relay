@@ -52,6 +52,31 @@ QUIET_ONLY = {
 
 QUIET_RMS = 0.01          # a slice whose loudness (RMS, 0..1) stays under this is quiet
 
+# The script each spoken language is written in. A transcript for one of these that is largely in ANOTHER
+# non-Latin script is invented (seen live: a Khmer slice transcribed partly in Thai letters). Latin letters are
+# always allowed: names, English words and numbers mix into every language.
+_THAI, _LAO = (0x0E00, 0x0E7F), (0x0E80, 0x0EFF)
+# Lao speech is often transcribed in Thai letters (the languages are close and the text still means the right
+# thing; four such FLEURS transcripts were kept for that reason), so each of the two accepts the other's script.
+SCRIPTS = {"my": [(0x1000, 0x109F)], "km": [(0x1780, 0x17FF)], "lo": [_LAO, _THAI], "th": [_THAI, _LAO]}
+FOREIGN_SCRIPT_SHARE = 0.25
+
+
+def foreign_script_share(text: str, lang: str | None) -> float:
+    """Share of the letters that belong neither to `lang`'s script nor to Latin (0 when unknown)."""
+    expected = SCRIPTS.get(lang or "")
+    letters = [ch for ch in str(text) if unicodedata.category(ch)[0] in ("L", "M")]
+    if not letters:
+        return 0.0
+    def foreign(ch: str) -> bool:
+        code = ord(ch)
+        if code < 0x0250 or 0x1E00 <= code <= 0x1EFF:          # Latin, including Vietnamese letters
+            return False
+        if expected is None:
+            return False if lang in (None, "", "auto") else True   # a Latin-script language: any other script is foreign
+        return not any(low <= code <= high for low, high in expected)
+    return sum(1 for ch in letters if foreign(ch)) / len(letters)
+
 _REPEAT = re.compile(r"(.{1,20}?)\1{4,}", re.DOTALL)
 
 
@@ -71,8 +96,11 @@ def normalise(text: str) -> str:
     return " ".join("".join(kept).split())
 
 
-def reason(text: str, rms: float | None = None) -> str | None:
-    """Why `text` is not speech, or None when it should be kept. `rms` is the slice's loudness if known."""
+def reason(text: str, rms: float | None = None, lang: str | None = None) -> str | None:
+    """Why `text` is not speech, or None when it should be kept. `rms` is the slice's loudness and `lang` the
+    spoken language, when known."""
+    if lang and foreign_script_share(text, lang) >= FOREIGN_SCRIPT_SHARE:
+        return f"largely written in another language's script (not {lang})"
     clean = normalise(text)
     if not clean:
         return "only symbols or punctuation" if str(text).strip() else None
@@ -90,5 +118,5 @@ def reason(text: str, rms: float | None = None) -> str | None:
     return None
 
 
-def is_spurious(text: str, rms: float | None = None) -> bool:
-    return enabled() and reason(text, rms) is not None
+def is_spurious(text: str, rms: float | None = None, lang: str | None = None) -> bool:
+    return enabled() and reason(text, rms, lang) is not None

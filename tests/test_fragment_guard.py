@@ -62,6 +62,34 @@ class RepetitionTests(unittest.TestCase):
             self.assertFalse(is_spurious(text, LOUD), text)
 
 
+class ScriptTests(unittest.TestCase):
+    KHMER_WITH_THAI = "មហាភ័យរราย"   # seen live
+
+    def test_a_transcript_largely_in_another_languages_script_is_dropped(self):
+        self.assertTrue(is_spurious(self.KHMER_WITH_THAI, LOUD, "km"))
+        self.assertTrue(is_spurious("สวัสดีครับ", LOUD, "vi"))   # Thai for Vietnamese
+        self.assertTrue(is_spurious("မင်္ဂလာ", LOUD, "km"))                       # Burmese for Khmer
+
+    def test_latin_words_mix_into_every_language(self):
+        self.assertFalse(is_spurious("សូមស្វាគមន៍ UIT", LOUD, "km"))
+        self.assertFalse(is_spurious("Welcome to UIT", LOUD, "my"))
+        self.assertFalse(is_spurious("Chào mừng đến với UIT", LOUD, "vi"))
+
+    def test_lao_may_be_written_in_thai_letters_and_the_other_way_round(self):
+        thai = "อุบัติเหตุดังกล่าว"
+        self.assertFalse(is_spurious(thai, LOUD, "lo"))
+        self.assertFalse(is_spurious("ສະບາຍດີ", LOUD, "th"))
+
+    def test_without_a_language_the_rule_does_not_apply(self):
+        self.assertFalse(is_spurious(self.KHMER_WITH_THAI, LOUD, None))
+        self.assertFalse(is_spurious(self.KHMER_WITH_THAI, LOUD, "auto"))
+
+    def test_the_transcriber_passes_the_spoken_language(self):
+        with self.assertLogs("polyglot.stt", level="INFO"):
+            self.assertTrue(stt_service._spurious(self.KHMER_WITH_THAI, None, "km"))
+        self.assertFalse(stt_service._spurious(self.KHMER_WITH_THAI, None, None))
+
+
 class SwitchTests(unittest.TestCase):
     def test_it_can_be_switched_off(self):
         with mock.patch.dict(os.environ, {"POLYGLOT_FRAGMENT_GUARD": "0"}):

@@ -95,6 +95,10 @@ class RoutingInTranscribeFileTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         stt_service._WHISPER_CACHE.clear()
         self.addCleanup(stt_service._WHISPER_CACHE.clear)
+        # Synthetic signals, not speech: the voice check has its own tests.
+        voice = mock.patch.object(stt_service.voice_check, "not_a_voice", return_value=False)
+        voice.start()
+        self.addCleanup(voice.stop)
         patcher = mock.patch.dict("os.environ", {"POLYGLOT_FILE_CHUNK_SECONDS": "15"})
         patcher.start()
         self.addCleanup(patcher.stop)

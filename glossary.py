@@ -29,12 +29,14 @@ CHECK_EVERY = 2.0          # seconds between looks at the file's modification ti
 
 
 def placeholder(index: int) -> str:
-    # Chosen by trying several styles on the live LibreTranslate (see tests/test_glossary.py): a short
-    # all-capitals code with digits came back untouched in every language it serves.
-    return f"ZQX{index}Q"
+    # Chosen by trying eight styles on the live LibreTranslate (2026-10-23) in Vietnamese, Indonesian, Thai,
+    # Malay and Filipino: only a short empty tag survived in all five. Codes such as ZQX0Q were bent
+    # (Vietnamese turned ZQX2Q into ZQ2Q), and brackets, braces and hashes were dropped or merged. The tag
+    # sometimes comes back respaced ("<x1 />", "< x0 / >"), which _PLACEHOLDER accepts.
+    return f"<x{index}/>"
 
 
-_PLACEHOLDER = re.compile(r"Z\s?Q\s?X\s?(\d+)\s?Q", re.IGNORECASE)
+_PLACEHOLDER = re.compile(r"<\s*x\s*(\d+)\s*/\s*>", re.IGNORECASE)
 
 
 class Glossary:
